@@ -294,3 +294,36 @@ def test_save_temps_isolates_same_hash_compilations(monkeypatch, tmp_path):
     assert first.parent == second.parent == tmp_path
     assert (first / "kernel.ll").read_text() == "first compilation"
     assert (second / "kernel.ll").read_text() == "second compilation"
+
+
+def _half_p_options():
+    return dict(enable_cvp_attention_key_major=True, enable_cvp_attention_dense_p=True,
+                enable_cvp_attention_half_p_stream=True, cvp_attention_producer_fusion="max-p-state",
+                cvp_attention_reduction_chains=2, enable_cvp_attention_score_rematerialization=True,
+                enable_cvp_attention_max_scaling=True, allow_cvp_attention_sum_reassociation=True,
+                enable_preload=True, enable_dynamic_cv_pipeline=False, enable_mixed_cv=True,
+                enable_vf_operand_substitution=True, enable_fused_multiply_add=True, unit_flag=False)
+
+
+def test_half_p_option_requires_complete_supported_recipe():
+    assert compiler._validate_attention_layout_options(_half_p_options()) is True
+    for key, value in (("unit_flag", True), ("enable_cvp_attention_last_output", True),
+                       ("enable_cvp_query_pipeline", True), ("enable_cvp_attention_first_state", True),
+                       ("enable_cvp_attention_max_scaling", False),
+                       ("allow_cvp_attention_sum_reassociation", False)):
+        options = _half_p_options()
+        options[key] = value
+        with pytest.raises(ValueError):
+            compiler._validate_attention_layout_options(options)
+
+
+def test_half_p_option_rejects_non_boolean():
+    options = _half_p_options()
+    options["enable_cvp_attention_half_p_stream"] = 1
+    with pytest.raises(TypeError):
+        compiler._validate_attention_layout_options(options)
+
+
+def test_half_p_option_is_part_of_metadata_controls():
+    assert "enable_cvp_attention_half_p_stream" in compiler._ATTENTION_LAYOUT_CONTROLS
+    assert compiler.NPUOptions.__dataclass_fields__["enable_cvp_attention_half_p_stream"].default is None

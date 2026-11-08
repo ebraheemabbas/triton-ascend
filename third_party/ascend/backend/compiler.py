@@ -34,6 +34,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple, Union
 from .debug_line_rewriter import rewrite_debug_line
+from .toolchain import toolchain_fingerprint
 
 from triton._C.libtriton import ir, passes, ascend, buffer_ir
 from triton._C.libtriton.ascend import ir as ascend_ir
@@ -539,6 +540,12 @@ def __get_metadata_attr_by_callback(lib, postfix: str, metadata, meta_key: str):
         metadata[meta_key] = callback_func()
 
 
+
+
+
+
+
+
 def _parse_linalg_metadata(linalg: str, metadata: dict):
     """
     Parse Linalg IR to extract metadata required for NPU compilation.
@@ -649,6 +656,378 @@ def get_common_bishengir_compile_options(metadata):
     bishengir_target = metadata['target'].arch
     bishengir_target_opt = f"--target={bishengir_target}"
     return [bishengir_target_opt]
+
+
+def _optimized_metaop_compile_options(compiler_path, env=None):
+    # CANN's version does not identify the selected frontend's CLI. B060 and
+    # source-built frontends can lack this optional switch even with CANN 9.2.
+    try:
+        result = subprocess.run([compiler_path, "--help"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0 or not re.search(r"(?m)^\s*--enable-optimized-metaop(?:[=\s]|$)", result.stdout or ""):
+        return []
+    return [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
+
+
+def _native_attention_analysis_options(metadata, compiler_path, env):
+    value = metadata.get("enable_cvp_attention_analysis")
+    if value is None:
+        return []
+    flag = "--enable-cvp-attention-analysis"
+    try:
+        result = subprocess.run([compiler_path, "--help"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("cannot verify requested CVPipeline attention analysis option") from error
+    if result.returncode != 0 or not re.search(r"(?m)^\s*" + re.escape(flag) + r"(?:[=\s]|$)", result.stdout or ""):
+        raise RuntimeError(f"selected NPU compiler does not support requested {flag}")
+    return [f"{flag}={value}"]
+
+
+def _validate_attention_vector_recipe_options(options, feature):
+    query_unroll = (options.get("enable_cvp_query_pipeline") is True
+                    and options.get("cvp_query_pipeline_mode") == "unroll")
+    if (options.get("enable_dynamic_cv_pipeline") is not False
+            or options.get("enable_preload") is not (False if query_unroll else True)
+            or options.get("enable_mixed_cv") is not True):
+        if query_unroll:
+            raise ValueError(f"CVPipeline {feature} requires explicit mixed-CV, preload=False and DCVP=False for ordinary-Unroll queries")
+        raise ValueError(f"CVPipeline {feature} requires explicit mixed-CV and preload with DCVP disabled")
+    # Keep both choices explicit. FMA contracts operations through the existing
+    # AVE lowering; it does not authorize changing any reduction tree.
+    if type(options.get("enable_vf_operand_substitution")) is not bool:
+        raise ValueError(f"CVPipeline {feature} requires explicit enable_vf_operand_substitution=True or False")
+    if type(options.get("enable_fused_multiply_add")) is not bool:
+        raise ValueError(f"CVPipeline {feature} requires explicit enable_fused_multiply_add=True or False")
+
+
+def _validate_attention_score_rematerialization_options(options):
+    _validate_attention_vector_recipe_options(options, "score rematerialization")
+
+
+def _native_attention_score_rematerialization_options(metadata, compiler_path, env):
+    value = metadata.get("enable_cvp_attention_score_rematerialization")
+    if value is None:
+        return []
+    if value is True:
+        _validate_attention_score_rematerialization_options(metadata)
+        # Recheck the effective lowering route, which is learned after option parsing.
+        if (metadata.get("compile_on_910_95") is not True or metadata.get("parallel_mode") != "simd"
+                or metadata.get("mix_mode") != "mix"):
+            raise ValueError("CVPipeline score rematerialization requires a final Ascend 950/910_95 SIMD mixed-CV route")
+    flag = "--enable-cvp-attention-score-rematerialization"
+    try:
+        result = subprocess.run([compiler_path, "--help"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("cannot verify requested CVPipeline score rematerialization option") from error
+    if result.returncode != 0 or not re.search(r"(?m)^\s*" + re.escape(flag) + r"(?:[=\s]|$)", result.stdout or ""):
+        raise RuntimeError(f"selected NPU compiler does not support requested {flag}")
+    return [f"{flag}={value}"]
+
+
+def _validate_attention_max_scaling_options(options):
+    if options.get("enable_cvp_attention_score_rematerialization") is not True:
+        raise ValueError("CVPipeline max scaling requires enable_cvp_attention_score_rematerialization=True")
+    _validate_attention_score_rematerialization_options(options)
+
+
+def _native_attention_max_scaling_options(metadata, compiler_path, env):
+    value = metadata.get("enable_cvp_attention_max_scaling")
+    if value is None:
+        return []
+    if value is True:
+        _validate_attention_max_scaling_options(metadata)
+        if (metadata.get("compile_on_910_95") is not True or metadata.get("parallel_mode") != "simd"
+                or metadata.get("mix_mode") != "mix"):
+            raise ValueError("CVPipeline max scaling requires a final Ascend 950/910_95 SIMD mixed-CV route")
+    flag = "--enable-cvp-attention-max-scaling"
+    try:
+        result = subprocess.run([compiler_path, "--help"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("cannot verify requested CVPipeline max scaling option") from error
+    if result.returncode != 0 or not re.search(r"(?m)^\s*" + re.escape(flag) + r"(?:[=\s]|$)", result.stdout or ""):
+        raise RuntimeError(f"selected NPU compiler does not support requested {flag}")
+    return [f"{flag}={value}"]
+
+
+def _native_attention_rows2_options(metadata, compiler_path, env):
+    value = metadata.get("enable_cvp_attention_rows2")
+    if value is None:
+        return []
+    if type(value) is not bool:
+        raise TypeError("enable_cvp_attention_rows2 must be a boolean or None")
+    if value is True:
+        _validate_attention_vector_recipe_options(metadata, "rows2")
+        if (metadata.get("compile_on_910_95") is not True or metadata.get("parallel_mode") != "simd"
+                or metadata.get("mix_mode") != "mix"):
+            raise ValueError("CVPipeline rows2 requires a final Ascend 950/910_95 SIMD mixed-CV route")
+    flag = "--enable-cvp-attention-rows2"
+    try:
+        result = subprocess.run([compiler_path, "--help"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("cannot verify requested CVPipeline rows2 option") from error
+    if result.returncode != 0 or not re.search(r"(?m)^\s*" + re.escape(flag) + r"(?:[=\s]|$)", result.stdout or ""):
+        raise RuntimeError(f"selected NPU compiler does not support requested {flag}")
+    return [f"{flag}={value}"]
+
+
+_ATTENTION_BOUNDARY_CONTROLS = (
+    ("enable_cvp_attention_first_output", "first output"),
+    ("enable_cvp_attention_last_output", "last output"),
+    ("enable_cvp_attention_first_state", "first probability state"),
+)
+
+
+def _native_attention_boundary_options(metadata, compiler_path, env):
+    requested = [(name, label, metadata.get(name)) for name, label in _ATTENTION_BOUNDARY_CONTROLS
+                 if metadata.get(name) is not None]
+    if not requested:
+        return []
+    for name, label, value in requested:
+        if type(value) is not bool:
+            raise TypeError(f"{name} must be a boolean or None")
+        if value:
+            _validate_attention_vector_recipe_options(metadata, label)
+            if (metadata.get("compile_on_910_95") is not True or metadata.get("parallel_mode") != "simd"
+                    or metadata.get("mix_mode") != "mix"):
+                raise ValueError(f"CVPipeline {label} requires a final Ascend 950/910_95 SIMD mixed-CV route")
+    try:
+        result = subprocess.run([compiler_path, "--help"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("cannot verify requested CVPipeline boundary options") from error
+    options = []
+    for name, _label, value in requested:
+        flag = "--" + name.replace("_", "-")
+        if result.returncode != 0 or not re.search(r"(?m)^\s*" + re.escape(flag) + r"(?:[=\s]|$)", result.stdout or ""):
+            raise RuntimeError(f"selected NPU compiler does not support requested {flag}")
+        options.append(f"{flag}={value}")
+    return options
+
+
+_ATTENTION_LAYOUT_CONTROLS = (
+    "enable_cvp_attention_key_major",
+    "enable_cvp_attention_dense_p",
+    "enable_cvp_attention_half_p_stream",
+    "cvp_attention_producer_fusion",
+    "cvp_attention_reduction_chains",
+    "allow_cvp_attention_sum_reassociation",
+    "enable_cvp_query_pipeline",
+    "enable_cvp_query_state_copy_forward",
+    "enable_cvp_query_final_output_forward",
+    "enable_cvp_query_output_copy_forward",
+    "enable_cvp_query_scalar_input_forward",
+    "cvp_query_pipeline_mode",
+    "cvp_query_key_unroll",
+    "cvp_invariant_cache_mode",
+    "cvp_invariant_cache_consider_overlapping",
+    "enable_cvp_cube_banked_ready",
+    "enable_cvp_cube_overlap",
+    "enable_cvp_cube_derived_drain",
+)
+
+
+def _normalize_invariant_cache_keys(options):
+    """Accept the legacy metadata keys and prefer the new names."""
+    legacy = {
+        "cvp_q_cache_mode": "cvp_invariant_cache_mode",
+        "cvp_q_cache_consider_overlapping": "cvp_invariant_cache_consider_overlapping",
+    }
+    for old, new in legacy.items():
+        if options.get(new) is None and options.get(old) is not None:
+            options[new] = options.pop(old)
+
+
+def _cvp_query_buffer_policy(options):
+    """Resolve the stock buffer policy before serializing native options.
+
+    Cross-scope tightly-coupled reuse is unsafe for the continuous query
+    stream. None means automatic: protect query streams and preserve the
+    ordinary default elsewhere. An explicit unsafe False must not be ignored.
+    """
+    value = options.get("disable_tightly_coupled_buffer_reuse")
+    if value is not None and type(value) is not bool:
+        raise TypeError("disable_tightly_coupled_buffer_reuse must be a boolean or None")
+    if options.get("enable_cvp_query_pipeline") is True:
+        if value is False:
+            raise ValueError("CVPipeline query pipeline requires disable_tightly_coupled_buffer_reuse=True")
+        return True
+    return False if value is None else value
+
+
+def _validate_attention_layout_options(options):
+    _normalize_invariant_cache_keys(options)
+    _cvp_query_buffer_policy(options)
+    query_mode = options.get("cvp_query_pipeline_mode")
+    query_lanes = options.get("cvp_query_key_unroll")
+    if query_mode is not None and (type(query_mode) is not str or query_mode not in ("skew", "unroll")):
+        raise ValueError("cvp_query_pipeline_mode must be skew, unroll, or None")
+    if query_lanes is not None and (type(query_lanes) is not int or query_lanes not in (1, 2, 4)):
+        raise ValueError("cvp_query_key_unroll must be 1, 2, 4, or None")
+    if query_mode == "unroll" and options.get("enable_cvp_query_pipeline") is not True:
+        raise ValueError("ordinary-Unroll query mode requires enable_cvp_query_pipeline=True")
+    if query_lanes in (2, 4) and query_mode != "unroll":
+        raise ValueError("multiple query issue lanes require explicit ordinary-Unroll mode")
+    for name in ("enable_cvp_attention_key_major", "enable_cvp_attention_dense_p",
+                 "enable_cvp_attention_half_p_stream",
+                 "allow_cvp_attention_sum_reassociation", "enable_cvp_query_pipeline",
+                 "enable_cvp_query_state_copy_forward", "enable_cvp_query_final_output_forward",
+                 "enable_cvp_query_output_copy_forward", "enable_cvp_query_scalar_input_forward",
+                 "enable_cvp_cube_banked_ready", "enable_cvp_cube_overlap", "enable_cvp_cube_derived_drain"):
+        value = options.get(name)
+        if value is not None and type(value) is not bool:
+            raise TypeError(f"{name} must be a boolean or None")
+    fusion = options.get("cvp_attention_producer_fusion")
+    if fusion is not None and (type(fusion) is not str or fusion not in ("none", "p-state", "max-p-state")):
+        raise ValueError("cvp_attention_producer_fusion must be none, p-state, max-p-state, or None")
+    cache_mode = options.get("cvp_invariant_cache_mode")
+    if (options.get("enable_cvp_query_state_copy_forward") is True
+            and options.get("enable_cvp_query_pipeline") is not True):
+        raise ValueError("CVPipeline query state copy forwarding requires an explicit query pipeline")
+    if (options.get("enable_cvp_query_final_output_forward") is True
+            and options.get("enable_cvp_query_pipeline") is not True):
+        raise ValueError("CVPipeline query final output forwarding requires an explicit query pipeline")
+    if options.get("enable_cvp_query_output_copy_forward") is True:
+        required = ("enable_cvp_query_pipeline", "enable_cvp_query_state_copy_forward",
+                    "enable_cvp_query_final_output_forward", "enable_vf_operand_substitution")
+        if any(options.get(name) is not True for name in required):
+            raise ValueError("CVPipeline output copy forwarding requires explicit query pipeline, "
+                             "state/final output forwarding and VF operand substitution")
+        if query_mode not in (None, "skew") or query_lanes not in (None, 1):
+            raise ValueError("CVPipeline output copy forwarding requires stored Skew/U1; Unroll is unqualified")
+    if options.get("enable_cvp_query_scalar_input_forward") is True:
+        required = ("enable_cvp_query_pipeline", "enable_vf_operand_substitution")
+        if any(options.get(name) is not True for name in required):
+            raise ValueError("CVPipeline scalar input forwarding requires explicit query pipeline "
+                             "and VF operand substitution")
+        if query_mode not in (None, "skew") or query_lanes not in (None, 1):
+            raise ValueError("CVPipeline scalar input forwarding requires stored Skew/U1; Unroll is unqualified")
+    if cache_mode is not None and (type(cache_mode) is not str or cache_mode not in ("none", "neutral", "cached", "auto")):
+        raise ValueError("cvp_invariant_cache_mode must be none, neutral, cached, auto, or None")
+    cache_overlap = options.get("cvp_invariant_cache_consider_overlapping")
+    if cache_overlap is not None and type(cache_overlap) is not bool:
+        raise ValueError("cvp_invariant_cache_consider_overlapping must be a boolean or None")
+    if cache_overlap is False and options.get("enable_cvp_cube_banked_ready") is True:
+        raise ValueError("CVPipeline banked Cube readiness requires co-resident Cube accounting")
+    if query_mode == "unroll" and cache_mode in ("neutral", "cached", "auto"):
+        raise ValueError("continuous Unroll invariant-cache integration is not qualified")
+    if options.get("enable_cvp_cube_banked_ready") is True and cache_mode not in ("neutral", "cached", "auto"):
+        raise ValueError("CVPipeline banked Cube readiness requires a neutral, cached or auto normal-template pair")
+    if options.get("enable_cvp_cube_overlap") is True and options.get("enable_cvp_cube_banked_ready") is not True:
+        raise ValueError("CVPipeline Cube overlap requires explicit banked Cube readiness")
+    if options.get("enable_cvp_cube_derived_drain") is True and options.get("enable_cvp_cube_banked_ready") is not True:
+        raise ValueError("CVPipeline derived Cube drain requires explicit banked Cube readiness")
+    chains = options.get("cvp_attention_reduction_chains")
+    if chains is not None and (type(chains) is not int or chains not in (1, 2, 4)):
+        raise ValueError("cvp_attention_reduction_chains must be 1, 2, 4, or None")
+    if chains == 2:
+        if (options.get("enable_cvp_attention_dense_p") is not True
+                or fusion != "max-p-state"
+                or options.get("enable_cvp_attention_score_rematerialization") is not True
+                or options.get("allow_cvp_attention_sum_reassociation") is not True):
+            raise ValueError("CVPipeline two-chain reduction requires dense P, fused max/P/state, "
+                             "score rematerialization and explicit FP32 sum reassociation")
+        if query_mode == "unroll":
+            raise ValueError("CVPipeline dense two-chain Unroll scheduling is not qualified")
+    if options.get("enable_cvp_attention_half_p_stream") is True:
+        if (options.get("enable_cvp_attention_dense_p") is not True
+                or fusion != "max-p-state" or chains != 2
+                or options.get("enable_cvp_attention_max_scaling") is not True
+                or options.get("allow_cvp_attention_sum_reassociation") is not True):
+            raise ValueError("CVPipeline half-P streaming requires dense two-chain max/P/state, "
+                             "max scaling and explicit FP32 sum reassociation")
+        if (options.get("enable_cvp_query_pipeline") is True
+                or options.get("enable_cvp_attention_first_state") is True
+                or options.get("enable_cvp_attention_last_output") is True
+                or options.get("enable_cvp_attention_rows2") is True
+                or cache_mode not in (None, "none")
+                or any(options.get(name) is True for name in
+                       ("enable_cvp_cube_banked_ready", "enable_cvp_cube_overlap", "enable_cvp_cube_derived_drain"))
+                or options.get("unit_flag") is not False
+                or query_mode not in (None, "skew") or query_lanes not in (None, 1)):
+            raise ValueError("CVPipeline half-P streaming requires ordinary Skew/U1, "
+                             "first-state/final-output and query/cache/Cube extensions disabled, "
+                             "and explicit unit_flag=False")
+    enabled = (options.get("enable_cvp_attention_key_major") is True
+               or options.get("enable_cvp_attention_dense_p") is True
+               or options.get("enable_cvp_attention_half_p_stream") is True
+               or fusion in ("p-state", "max-p-state") or chains in (2, 4)
+               or options.get("enable_cvp_query_pipeline") is True
+               or cache_mode in ("neutral", "cached", "auto"))
+    if not enabled:
+        return False
+    if options.get("enable_cvp_attention_key_major") is not True:
+        raise ValueError("CVPipeline packing, producer fusion and reduction chains require explicit key-major layout")
+    _validate_attention_vector_recipe_options(options, "key-major layout")
+    if options.get("allow_cvp_attention_sum_reassociation") is not True:
+        raise ValueError("CVPipeline key-major layout requires explicit FP32 sum reassociation permission; FMA is separate")
+    if options.get("enable_cvp_attention_rows2") is True:
+        raise ValueError("CVPipeline query-vector layout cannot use the independent rows2 schedule")
+    if cache_mode in ("neutral", "cached", "auto") and options.get("enable_cvp_query_pipeline") is not True:
+        raise ValueError("CVPipeline invariant-operand cache requires an explicit continuous query pipeline")
+    if options.get("enable_cvp_query_pipeline") is True:
+        if options.get("disable_auto_inject_block_sync") is True:
+            raise ValueError("CVPipeline query pipeline requires cross-core synchronization")
+    return True
+
+
+def _native_attention_layout_options(metadata, compiler_path, env):
+    _normalize_invariant_cache_keys(metadata)
+    requested = [(name, metadata.get(name)) for name in _ATTENTION_LAYOUT_CONTROLS
+                 if metadata.get(name) is not None]
+    if not requested:
+        return []
+    enabled = _validate_attention_layout_options(metadata)
+    if enabled and (metadata.get("compile_on_910_95") is not True or metadata.get("parallel_mode") != "simd"
+                    or metadata.get("mix_mode") != "mix"):
+        raise ValueError("CVPipeline key-major layout requires a final Ascend 950/910_95 SIMD mixed-CV route")
+    try:
+        result = subprocess.run([compiler_path, "--help"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("cannot verify requested CVPipeline layout options") from error
+    options = []
+    for name, value in requested:
+        flag = "--" + name.replace("_", "-")
+        if result.returncode != 0 or not re.search(r"(?m)^\s*" + re.escape(flag) + r"(?:[=\s]|$)", result.stdout or ""):
+            raise RuntimeError(f"selected NPU compiler does not support requested {flag}")
+        options.append(f"{flag}={value}")
+    return options
+
+
+def _native_vector_control_options(metadata, compiler_path, env):
+    requested = metadata.get("enable_vf_operand_substitution")
+    disabled = metadata.get("disable_vf_operand_substitution", False)
+    options = []
+    explicit = []
+    if requested is None:
+        # Preserve the existing DCVP-derived setting and its rc=3 safety gate.
+        if metadata.get("enable_dynamic_cv_pipeline") is True and not disabled:
+            options.append("--enable-vf-operand-substitution=True")
+    else:
+        if requested and disabled:
+            raise ValueError("explicit VF operand substitution conflicts with the compiler safety disable")
+        explicit.append(("--enable-vf-operand-substitution", requested))
+    fma = metadata.get("enable_fused_multiply_add")
+    if fma is not None:
+        explicit.append(("--enable-fused-multiply-add", fma))
+    if explicit:
+        try:
+            result = subprocess.run([compiler_path, "--help"], env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError("cannot verify requested native vector compiler options") from error
+        for flag, value in explicit:
+            pattern = r"(?m)^\s*" + re.escape(flag) + r"(?:[=\s]|$)"
+            if result.returncode != 0 or not re.search(pattern, result.stdout or ""):
+                raise RuntimeError(f"selected NPU compiler does not support requested {flag}")
+            options.append(f"{flag}={value}")
+    return options
 
 
 @functools.lru_cache()
@@ -786,8 +1165,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
 
-        _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
-
         npu_utils = NPUUtils()
         if npu_utils.has_device_limit():
             _compile_option_list += [
@@ -858,10 +1235,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--enable-mixed-cv={enable_mixed_cv}"]
 
-        enable_dynamic_cv_pipeline = metadata["enable_dynamic_cv_pipeline"]
-        if enable_dynamic_cv_pipeline == True and not metadata.get("disable_vf_operand_substitution", False):
-            _compile_option_list += [f"--enable-vf-operand-substitution=True"]
-
         enable_flatten = metadata["enable_flatten"]
         if enable_flatten is not None:
             _compile_option_list += \
@@ -894,6 +1267,14 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if metadata["auto_blockify_enabled"]:
             _compile_option_list += ["--enable-auto-blockify-loop"]
         npu_compiler_path, env = _get_npucompiler_path()
+        _compile_option_list += _optimized_metaop_compile_options(npu_compiler_path, env)
+        _compile_option_list += _native_vector_control_options(metadata, npu_compiler_path, env)
+        _compile_option_list += _native_attention_analysis_options(metadata, npu_compiler_path, env)
+        _compile_option_list += _native_attention_score_rematerialization_options(metadata, npu_compiler_path, env)
+        _compile_option_list += _native_attention_max_scaling_options(metadata, npu_compiler_path, env)
+        _compile_option_list += _native_attention_rows2_options(metadata, npu_compiler_path, env)
+        _compile_option_list += _native_attention_boundary_options(metadata, npu_compiler_path, env)
+        _compile_option_list += _native_attention_layout_options(metadata, npu_compiler_path, env)
         if npu_compiler_path.endswith("bishengir-compile"):
             _compile_option_list += [
                 "--enable-hfusion-compile=true",
@@ -962,6 +1343,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug:
             _dump_kernel_binary(metadata["hash"], bin_path)
 
+        lib = None
         if Path(callback_path).is_file():
             lib = ctypes.CDLL(callback_path)
             __get_metadata_attr_by_callback(lib, "_infer_task_type_function", metadata, "bs_task_type")
@@ -1032,8 +1414,6 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         _compile_option_list += [
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
-
-        _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
 
         if _is_ascend_sanitizer_enabled():
             _compile_option_list += ["--enable-sanitizer=true"]
@@ -1129,6 +1509,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if metadata["auto_blockify_enabled"]:
             _compile_option_list += ["--enable-auto-blockify-loop"]
         npu_compiler_path, env = _get_npucompiler_path()
+        _compile_option_list += _optimized_metaop_compile_options(npu_compiler_path, env)
         if npu_compiler_path.endswith("bishengir-compile"):
             _compile_option_list += [
                 "--enable-hfusion-compile=true",
@@ -1276,7 +1657,7 @@ class NPUOptions:
     disable_size_align_for_cast: bool = None
     enable_preload: bool = None
     enable_auto_bind_sub_block: bool = None
-    disable_tightly_coupled_buffer_reuse: bool = False
+    disable_tightly_coupled_buffer_reuse: Optional[bool] = None
     enable_hivm_auto_cv_balance: bool = None
     # Temporary 910_95 switch; the NPU compiler plans to make this default in Q4.
     enable_hivm_batch_matmul: bool = False
@@ -1299,6 +1680,35 @@ class NPUOptions:
     disable_auto_inject_block_sync: bool = None
     enable_mixed_cv: bool = None
     enable_dynamic_cv_pipeline: bool = None
+    # None preserves the existing compiler defaults and DCVP-derived VF policy.
+    # FMA permission is independent of reduction-tree reassociation.
+    enable_vf_operand_substitution: Optional[bool] = None
+    enable_fused_multiply_add: Optional[bool] = None
+    enable_cvp_attention_analysis: Optional[bool] = None
+    enable_cvp_attention_score_rematerialization: Optional[bool] = None
+    enable_cvp_attention_max_scaling: Optional[bool] = None
+    enable_cvp_attention_rows2: Optional[bool] = None
+    enable_cvp_attention_first_output: Optional[bool] = None
+    enable_cvp_attention_last_output: Optional[bool] = None
+    enable_cvp_attention_first_state: Optional[bool] = None
+    enable_cvp_attention_key_major: Optional[bool] = None
+    enable_cvp_query_pipeline: Optional[bool] = None
+    enable_cvp_query_state_copy_forward: Optional[bool] = None
+    enable_cvp_query_final_output_forward: Optional[bool] = None
+    enable_cvp_query_output_copy_forward: Optional[bool] = None
+    enable_cvp_query_scalar_input_forward: Optional[bool] = None
+    cvp_query_pipeline_mode: Optional[str] = None
+    cvp_query_key_unroll: Optional[int] = None
+    cvp_invariant_cache_mode: Optional[str] = None
+    cvp_invariant_cache_consider_overlapping: Optional[bool] = None
+    enable_cvp_cube_banked_ready: Optional[bool] = None
+    enable_cvp_cube_overlap: Optional[bool] = None
+    enable_cvp_cube_derived_drain: Optional[bool] = None
+    enable_cvp_attention_dense_p: Optional[bool] = None
+    enable_cvp_attention_half_p_stream: Optional[bool] = None
+    cvp_attention_producer_fusion: Optional[str] = None
+    cvp_attention_reduction_chains: Optional[int] = None
+    allow_cvp_attention_sum_reassociation: Optional[bool] = None
     enable_cube_block_merge: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = None
     buf_slot_num_of_veccore: int = None
@@ -1419,6 +1829,47 @@ class NPUOptions:
         else:
             object.__setattr__(self, "parallel_mode", "simd")
 
+        object.__setattr__(self, "disable_tightly_coupled_buffer_reuse",
+                           _cvp_query_buffer_policy(self.__dict__))
+
+        vector_controls = ("enable_vf_operand_substitution", "enable_fused_multiply_add",
+                           "enable_cvp_attention_analysis", "enable_cvp_attention_score_rematerialization",
+                           "enable_cvp_attention_max_scaling", "enable_cvp_attention_rows2",
+                           "enable_cvp_attention_first_output", "enable_cvp_attention_last_output",
+                           "enable_cvp_attention_first_state", "enable_cvp_attention_key_major",
+                           "enable_cvp_attention_dense_p", "allow_cvp_attention_sum_reassociation",
+                           "enable_cvp_query_pipeline", "enable_cvp_query_state_copy_forward",
+                           "enable_cvp_query_final_output_forward",
+                           "enable_cvp_query_output_copy_forward",
+                           "enable_cvp_query_scalar_input_forward")
+        for name in vector_controls:
+            value = getattr(self, name)
+            if value is not None and type(value) is not bool:
+                raise TypeError(f"{name} must be a boolean or None")
+        if (any(getattr(self, name) is not None for name in vector_controls)
+                or self.cvp_attention_producer_fusion is not None or self.cvp_attention_reduction_chains is not None
+                or self.cvp_invariant_cache_mode is not None
+                or self.cvp_invariant_cache_consider_overlapping is not None
+                or self.enable_cvp_cube_banked_ready is not None
+                or self.enable_cvp_cube_overlap is not None or self.enable_cvp_cube_derived_drain is not None):
+            if not self.compile_on_910_95 or self.is_pure_simt:
+                raise ValueError("native vector controls require an Ascend 950/910_95 SIMD compilation")
+        if self.enable_cvp_attention_analysis is True:
+            if self.enable_dynamic_cv_pipeline or self.enable_preload is not True or self.enable_mixed_cv is not True:
+                raise ValueError("CVPipeline attention analysis requires explicit mixed-CV and preload with DCVP disabled")
+        if self.enable_cvp_attention_max_scaling is True:
+            _validate_attention_max_scaling_options(self.__dict__)
+        if self.enable_cvp_attention_score_rematerialization is True:
+            _validate_attention_score_rematerialization_options(self.__dict__)
+        if self.enable_cvp_attention_rows2 is True:
+            _validate_attention_vector_recipe_options(self.__dict__, "rows2")
+        for name, label in _ATTENTION_BOUNDARY_CONTROLS:
+            if getattr(self, name) is True:
+                _validate_attention_vector_recipe_options(self.__dict__, label)
+        _validate_attention_layout_options(self.__dict__)
+        if self.enable_fused_multiply_add is True and self.disable_fma:
+            raise ValueError("enable_fused_multiply_add=True conflicts with disable_fma=True")
+
         if self.is_pure_simt:
             if self.shared_mem_dynamic_size is None:
                 object.__setattr__(self, "shared_mem_dynamic_size", 122880)
@@ -1426,6 +1877,9 @@ class NPUOptions:
             object.__setattr__(self, "shared_mem_dynamic_size", 221184)
 
     def hash(self):
+        # The selected cache mode belongs to the options key. The existing
+        # backend toolchain_fingerprint separately binds the actual packaged
+        # .bc/.ll/library contents, including the normal invariant-cache templates.
         key = "_".join([f"{name}-{val}" for name, val in self.__dict__.items()])
         key = "_".join([key, get_cann_version_file_hash()])
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -1680,11 +2134,13 @@ class AscendBackend(BaseBackend):
             raise NotImplementedError(f"Backend '{self.target.backend}' is not supported. "
                                       "Please ensure the target backend is set to 'npu'.")
 
-    @functools.lru_cache()
     def hash(self):
-        # TODO fetch compiler version
-        version_key = (self.target, _get_libdevice_compile_state())
-        return str(version_key)
+        compiler, environment = _get_npucompiler_path()
+        reader, _ = _get_bishengir_opt_path()
+        identity = toolchain_fingerprint(compiler, reader,
+                                         (_get_triton_mlir_opt_path(), _get_triton_opt_path()),
+                                         get_libdevice(), environment)
+        return str((self.target, _get_libdevice_compile_state(), identity))
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.cann import libdevice
