@@ -597,6 +597,184 @@ def EnableHIVMAutoCVBalance : HIVMOptimizationControlOptions<
   "false"
 >;
 
+def EnableCVPAttentionScoreRematerialization : HIVMOptimizationControlOptions<
+  "Remove a proved in-place scaled-score store in Skew attention; preserve reduction order.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPAttentionMaxScaling : HIVMOptimizationControlOptions<
+  "Scale a proved raw attention maximum after reduction; requires score rematerialization.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPAttentionRows2 : HIVMOptimizationControlOptions<
+  "Partially unroll proved independent CVPipeline attention rows by two.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPAttentionFirstOutput : HIVMOptimizationControlOptions<
+  "Specialize the first logical output update using proved initialized state.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPAttentionLastOutput : HIVMOptimizationControlOptions<
+  "Fuse the last logical output update, normalization and conversion.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPAttentionFirstState : HIVMOptimizationControlOptions<
+  "Specialize first-tile maximum and probability-state initialization.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPAttentionKeyMajor : HIVMOptimizationControlOptions<
+  "Use a proved key-major QK/P layout through actual Skew CVPipeline.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPQueryPipeline : HIVMOptimizationControlOptions<
+  "Pipeline persistent query blocks through verified CVPipeline stages.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPQueryStateCopyForward : HIVMOptimizationControlOptions<
+  "Forward proved read-only snapshots of owned CVPipeline O state.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def EnableCVPQueryFinalOutputForward : HIVMOptimizationControlOptions<
+  "Forward proved final FP16 output writes into owned CVPipeline query banks.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def EnableCVPQueryOutputCopyForward : HIVMOptimizationControlOptions<
+  "Forward proved row-local O updates directly into persistent query state.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def EnableCVPQueryScalarInputForward : HIVMOptimizationControlOptions<
+  "Forward proved readonly sum/maximum inputs directly from query banks.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def CvpQueryPipelineMode : HIVMOptimizationControlOptions<
+  "Continuous query emitter: skew or unroll; Unroll ownership remains a separate requirement.",
+  "std::string", "\"skew\""
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def CvpQueryKeyUnroll : HIVMOptimizationControlOptions<
+  "Continuous ordinary-Unroll issue lanes: 1, 2 or 4, independent of workspace buffers.",
+  "int", "1"
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def CvpQCacheMode : HIVMOptimizationControlOptions<
+  "Normal-template query Q cache: none, neutral, or cached (HD64/BN256, mode0).",
+  "std::string", "\"none\""
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def EnableCVPCubeDerivedDrain : HIVMOptimizationControlOptions<
+  "Derive useful Cube work and retain its exact cross-core signal suffix.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def EnableCVPCubeOverlap : HIVMOptimizationControlOptions<
+  "Overlap disjoint QK-FIX and PV after verifying banked Cube readiness.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def EnableCVPCubeBankedReady : HIVMOptimizationControlOptions<
+  "Use verified banked Cube and caller readiness with a normal Q-cache pair.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+  bit isSharedWithDownstreamToolchain = 0;
+}
+
+def EnableCVPAttentionHalfPStream : HIVMOptimizationControlOptions<
+  "Publish proved dense attention P through one half-sized UB scratch.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPAttentionDenseP : HIVMOptimizationControlOptions<
+  "Pack the two key halves of key-major FP16 P into dense vector stores.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def CVPAttentionProducerFusion : HIVMOptimizationControlOptions<
+  "Key-major attention producer fusion: none, p-state, or max-p-state.",
+  "std::string", "\"none\""
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def CVPAttentionReductionChains : HIVMOptimizationControlOptions<
+  "Attention maximum/sum chains: 1, 2 for closed dense fused max/P/state, or 4 for non-dense P.",
+  "unsigned", "1"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def AllowCVPAttentionSumReassociation : HIVMOptimizationControlOptions<
+  "Explicitly permit the FP32 sum-tree changes of key-major attention; separate from FMA.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
+def EnableCVPAttentionAnalysis : HIVMOptimizationControlOptions<
+  "Describe normalized attention and verify actual Skew CVPipeline application; no optimization.",
+  "bool", "false"
+> {
+  let optionScope = ["A5_ONLY"];
+}
+
 def EnableLazyLoading : HIVMOptimizationControlOptions<
   "Enable lazy loading in CV pipelining to reduce buffer expansion.",
   "bool",

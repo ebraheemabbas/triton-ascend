@@ -95,7 +95,7 @@ class HIVM_LocalMmadOp<string mnemonic, list<Trait> traits = []> :
     [HIVMLocalMatmulLikeOpTraits,
      HIVMUnitFlagEnabledInterface,
     ], traits)> {
-  let arguments = (ins Arg<TensorOrMemref, "Matrix A">:$a,
+  dag localMmadBaseArgs = (ins Arg<TensorOrMemref, "Matrix A">:$a,
                        Arg<TensorOrMemref, "Matrix B">:$b,
                        Arg<I1, [{
                         The condition under which
@@ -131,7 +131,8 @@ class HIVM_LocalMmadOp<string mnemonic, list<Trait> traits = []> :
                        }]>:$enable_I4,
                        OptionalAttr<UnitFlagArrayAttr>:$unit_flag_mode,
                        OptionalAttr<I64Attr>:$unit_flag_group_id
-                       );
+                        );
+  let arguments = localMmadBaseArgs;
   let results = (outs Variadic<AnyRankedTensor>:$result_tensors);
   code localMmadBaseDecls = [{
     // Implement functions necessary for DestinationStyleOpInterface.
@@ -159,7 +160,7 @@ class HIVM_LocalMmadOp<string mnemonic, list<Trait> traits = []> :
     C = C + A x B + (optional) channel_bias
     ```
   }];
-  let assemblyFormat = [{
+  string localMmadBaseAssemblyFormat = [{
     attr-dict `ins` `(`
     $a
     `,` $b
@@ -182,6 +183,7 @@ class HIVM_LocalMmadOp<string mnemonic, list<Trait> traits = []> :
     (`unit_flag_cond` `(` $unit_flag_cond^ `)` )?
     (`->` type($result_tensors)^)?
   }];
+  let assemblyFormat = localMmadBaseAssemblyFormat;
 
   let builders = [
     OpBuilder<(ins "TypeRange":$result_tensors,
@@ -207,6 +209,15 @@ def MmadL1Op : HIVM_LocalMmadOp<"mmadL1", [
   DeclareOpInterfaceMethods<HIVMStructuredOpInterface, ["getIndexingMaps"]>,
   DeclareOpInterfaceMethods<OpLayoutInterface, ["getOperandsTargetFractalLayout"]>,
 ]> {
+  let arguments = !con(localMmadBaseArgs, (ins
+      Optional<I1>:$q_cache_init,
+      Optional<I64>:$q_cache_generation,
+      Optional<I64>:$q_cache_byte_offset,
+      OptionalAttr<DictionaryAttr>:$cvp_q_cache));
+  let assemblyFormat = localMmadBaseAssemblyFormat # [{
+    (`q_cache_context` `(` $q_cache_init^ `,` $q_cache_generation
+       `,` $q_cache_byte_offset `)`)?
+  }];
   let summary = [{
     Matrix Multiply and Add Op with inputs from L1 memory hierarchy.
   }];

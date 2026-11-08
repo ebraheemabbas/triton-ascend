@@ -123,6 +123,28 @@ void setupHIVMPipelineOptions(
       options.setWorkspaceMultibuffer = 2;
   }
 
+  if (options.enableCVPQueryPipeline) {
+    auto mode = options.cvpQueryPipelineMode.getValue();
+    auto lanes = options.cvpQueryKeyUnroll.getValue();
+    if ((mode != "skew" && mode != "unroll") ||
+        (lanes != 1 && lanes != 2 && lanes != 4) ||
+        (mode == "skew" && lanes != 1))
+      llvm::report_fatal_error(
+          "unsupported continuous query mode/key-unroll combination");
+    if (mode == "unroll") {
+      if (options.enablePreload)
+        llvm::report_fatal_error("explicit ordinary-Unroll queries conflict "
+                                 "with enable-preload=true");
+      if (options.cvpQCacheMode.getValue() != "none")
+        llvm::report_fatal_error(
+            "continuous Unroll Q-cache integration is not qualified");
+      options.setCVPipelineMode = CVPipelineMode::Unroll;
+    } else if (!options.enablePreload) {
+      llvm::report_fatal_error(
+          "Skew query pipelines require enable-preload=true");
+    }
+  }
+
   // Backward compatibility: --enable-preload=true overrides
   // --enablecv-pipeline-mode to skew
   if (options.enablePreload) {
@@ -133,7 +155,6 @@ void setupHIVMPipelineOptions(
       options.setCVPipelineMode = CVPipelineMode::Skew;
     }
   }
-
 
   // When cv-pipelining is off, disable workspace multibuffer entirely
   // so downstream passes do not allocate extra buffer slots for CV software
@@ -217,6 +238,38 @@ void setupHIVMAVEPipelineOptions(
   hivmAVEPipelineOptions.maxReductionSplitNum = config.getMaxReductionSplit();
 }
 
+// Keep the optional native schedule mutations together before AVE conversion.
+static void
+buildFinalCVPSchedulePipeline(OpPassManager &pm,
+                              const BiShengIRCompileMainConfig &config) {
+  mlir::VerifyCVPQCacheOptions cacheOptions;
+  cacheOptions.mode = config.getCvpQCacheMode();
+  cacheOptions.requireMatch = cacheOptions.mode != "none";
+  pm.addPass(hivm::createVerifyCVPQCachePass(cacheOptions));
+
+  if (config.getEnableCVPCubeBankedReady()) {
+    mlir::CVPCubeReadinessOptions readyOptions;
+    readyOptions.enable = true;
+    pm.addPass(hivm::createCVPCubeReadinessPass(readyOptions));
+    // Recheck the scheduled pair and readiness reservation after mutation.
+    pm.addPass(hivm::createVerifyCVPQCachePass(cacheOptions));
+  }
+
+  if (config.getEnableCVPCubeOverlap()) {
+    mlir::CVPCubeOverlapOptions overlapOptions;
+    overlapOptions.enable = true;
+    pm.addPass(hivm::createCVPCubeOverlapPass(overlapOptions));
+    pm.addPass(hivm::createVerifyCVPQCachePass(cacheOptions));
+  }
+
+  if (config.getEnableCVPCubeDerivedDrain()) {
+    mlir::CVPCubeDerivedDrainOptions drainOptions;
+    drainOptions.enable = true;
+    pm.addPass(hivm::createCVPCubeDerivedDrainPass(drainOptions));
+    pm.addPass(hivm::createVerifyCVPQCachePass(cacheOptions));
+  }
+}
+
 void buildBiShengHIRAVEToLLVMPipeline(
     OpPassManager &pm, const BiShengIRCompileMainConfig &config) {
   if (config.getCompileHost()) {
@@ -238,6 +291,8 @@ void buildBiShengHIRAVEToLLVMPipeline(
 /// Build the pipeline to lower BiShengHIR to LLVM Dialect IR
 void buildLowerToLLVMPipeline(OpPassManager &pm,
                               const BiShengIRCompileMainConfig &config) {
+
+  buildFinalCVPSchedulePipeline(pm, config);
 
   const bool ascendDebugPrint =
       StringRef(getenv("ASCEND_DEBUG_PRINT")) == "ALL";
@@ -328,6 +383,35 @@ static void buildDelayedHFusionRegBaseVectorizePipeline(
   hfusion::regbase::buildHFusionRegBasePipeline(pm, hfusionPipelineOptions);
   if (shouldInferFuncCoreType) {
     pm.addPass(mlir::hivm::createInferFuncCoreTypePass());
+  }
+
+  if (config.getEnableCVPAttentionKeyMajor()) {
+    CVPAttentionQueryVectorOptions attentionOptions;
+    attentionOptions.enableScoreRematerialization =
+        config.getEnableCVPAttentionScoreRematerialization();
+    attentionOptions.enableMaxScaling =
+        config.getEnableCVPAttentionMaxScaling();
+    const auto &fusion = config.getCVPAttentionProducerFusion();
+    attentionOptions.fuseProbability = fusion != "none";
+    attentionOptions.fuseState = fusion != "none";
+    attentionOptions.fuseMaximum = fusion == "max-p-state";
+    attentionOptions.reductionChains = config.getCVPAttentionReductionChains();
+    attentionOptions.allowSumReassociation =
+        config.getAllowCVPAttentionSumReassociation();
+    attentionOptions.enableDenseP = config.getEnableCVPAttentionDenseP();
+    attentionOptions.requireMatch = true;
+    // Match the generated tensor VFs while their reductions, casts and SSA
+    // destinations are explicit, before tensor conversion and bufferization.
+    pm.addPass(hivm::createCVPAttentionQueryVectorPass(attentionOptions));
+  }
+
+  if (config.getEnableCVPQueryPipeline()) {
+    // Vector partitioning has fixed the local row shapes here. Keep final
+    // output/M storage persistent without carrying snapshots through each key.
+    pm.addPass(hivm::createCVPQueryOutputStoragePass());
+    // Bufferization must not create effectful state-copy operations outside
+    // the guarded stages: preload shifts stages after memory is planned.
+    pm.addPass(hivm::createCVPQueryStateStoragePass());
   }
 
   ConvertHFusionToHIVMOptions hfs2hivmOptions;

@@ -101,6 +101,10 @@ public:
 
         execute();
 
+        // A module pass may replace the body while filtered children are
+        // hidden.
+        body = mod.getBody();
+
         // Restore in original order: insert each op after its predecessor.
         for (auto *op : llvm::reverse(hidden)) {
           body->push_front(op);

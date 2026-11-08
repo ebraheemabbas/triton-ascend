@@ -63,6 +63,49 @@ namespace mlir {
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h.inc"
 
 namespace hivm {
+std::unique_ptr<Pass>
+createCVPAttentionLayoutPass(const CVPAttentionLayoutOptions &options = {});
+std::unique_ptr<Pass>
+createCVPQueryPipelinePass(const CVPQueryPipelineOptions &options = {});
+std::unique_ptr<Pass> createCVPQueryOutputStoragePass(
+    const CVPQueryOutputStorageOptions &options = {});
+std::unique_ptr<Pass>
+createCVPQueryStateStoragePass(const CVPQueryStateStorageOptions &options = {});
+std::unique_ptr<Pass> createCVPQueryStateCopyForwardPass(
+    const CVPQueryStateCopyForwardOptions &options = {});
+std::unique_ptr<Pass> createCVPQueryFinalOutputForwardPass(
+    const CVPQueryFinalOutputForwardOptions &options = {});
+std::unique_ptr<Pass> createCVPQueryOutputCopyForwardPass(
+    const CVPQueryOutputCopyForwardOptions &options = {});
+std::unique_ptr<Pass> createCVPQueryScalarInputForwardPass(
+    const CVPQueryScalarInputForwardOptions &options = {});
+std::unique_ptr<Pass> createCVPQCachePass(const CVPQCacheOptions &options = {});
+std::unique_ptr<Pass>
+createVerifyCVPQCachePass(const VerifyCVPQCacheOptions &options = {});
+std::unique_ptr<Pass>
+createCVPCubeReadinessPass(const CVPCubeReadinessOptions &options = {});
+std::unique_ptr<Pass>
+createCVPCubeOverlapPass(const CVPCubeOverlapOptions &options = {});
+std::unique_ptr<Pass>
+createCVPCubeDerivedDrainPass(const CVPCubeDerivedDrainOptions &options = {});
+std::unique_ptr<Pass> createCVPAttentionQueryVectorPass(
+    const CVPAttentionQueryVectorOptions &options = {});
+std::unique_ptr<Pass>
+createCVPAttentionVectorPass(const CVPAttentionVectorOptions &options = {});
+std::unique_ptr<Pass>
+createCVPAttentionPStreamPass(const CVPAttentionPStreamOptions &options = {});
+std::unique_ptr<Pass> createCVPAttentionVectorSchedulePass(
+    const CVPAttentionVectorScheduleOptions &options = {});
+std::unique_ptr<Pass>
+createCVPAttentionBoundaryPass(const CVPAttentionBoundaryOptions &options = {});
+
+/// Describe original attention without changing arithmetic.
+std::unique_ptr<Pass>
+createCVPAttentionPreparePass(const CVPAttentionPrepareOptions &options = {});
+/// Verify actual Skew application and optionally remove analysis annotations.
+std::unique_ptr<Pass>
+createVerifyCVPAttentionPass(const VerifyCVPAttentionOptions &options = {});
+
 /// Create a pass to infer the core type of each function.
 std::unique_ptr<Pass> createInferFuncCoreTypePass();
 
@@ -442,7 +485,6 @@ std::unique_ptr<Pass> createFuseTransposeIntoLoadPass();
 std::unique_ptr<Pass> createTensorCopyInsertionPass();
 std::unique_ptr<Pass> createTensorCopyInsertionPass(
     const bufferization::OneShotBufferizationOptions &options);
-
 
 //===----------------------------------------------------------------------===//
 // Registration

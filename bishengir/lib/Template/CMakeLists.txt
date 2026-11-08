@@ -45,6 +45,9 @@ endfunction()
  Core_type: "aic" "aiv" "host"
  Platform_type: "Ascend910B"]]
 function(compile_single_cpp_to_bc cpp_with_path core_type platform_type)
+    set(cvp_contract_dependencies)
+    get_filename_component(cvp_public_include
+        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../include" ABSOLUTE)
     # Get name of xx.bc
     string(REGEX MATCHALL "[0-9A-Za-z_]*.cpp" cpp_name ${cpp_with_path})
 
@@ -131,6 +134,11 @@ function(compile_single_cpp_to_bc cpp_with_path core_type platform_type)
         set(bc_arch_tag "${core_type}${arch_suffix_tok}")
     endif ()
 
+    if(cpp_with_path MATCHES "/RegBase/Cube/LocalMmad\\.cpp$")
+        list(APPEND bisheng_args "-I${cvp_public_include}")
+        list(APPEND cvp_contract_dependencies
+            "${cvp_public_include}/bishengir/Dialect/Utils/CVPCubeResourcePlan.h")
+    endif()
     set(bc_output "${CMAKE_CURRENT_BINARY_DIR}/${bc_name}")
     string(REGEX REPLACE ";" " " compile_command "${BISHENG_TOOL} ${bisheng_args}")
     message("-- command of compile cpp to bc is ${compile_command}")
@@ -147,7 +155,8 @@ function(compile_single_cpp_to_bc cpp_with_path core_type platform_type)
         OUTPUT "${bc_output}"
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         COMMAND ${BISHENG_TOOL} ${bisheng_args}
-        DEPENDS "${cpp_with_path}" ${BISHENGIR_TEMPLATE_HEADERS} "${compile_signature}"
+        DEPENDS "${cpp_with_path}" ${BISHENGIR_TEMPLATE_HEADERS}
+                ${cvp_contract_dependencies} "${compile_signature}"
         COMMENT "[ccec] ${cpp_name} -> ${bc_name}"
         VERBATIM
     )

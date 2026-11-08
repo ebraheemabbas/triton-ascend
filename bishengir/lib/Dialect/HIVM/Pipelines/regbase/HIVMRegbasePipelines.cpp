@@ -317,6 +317,11 @@ static void convertTensorToTightCoupledBuffer(OpPassManager &pm) {
       createInsertCVTightCoupledBufferPass(options));
 }
 
+static bool usesContinuousQueryUnroll(const HIVMPipelineOptions &options) {
+  return options.enableCVPQueryPipeline &&
+         options.cvpQueryPipelineMode.getValue() == "unroll";
+}
+
 static void hivmPreBufferizationOptimizationPipeline(
     OpPassManager &pm, const HIVMPipelineOptions &hivmPipelineOptions) {
   if (!hacc::utils::isRegBasedArch(hivmPipelineOptions.target)) {
@@ -389,16 +394,26 @@ static void hivmPreBufferizationOptimizationPipeline(
       hivmPipelineOptions.limitAutoMultiBufferOfLocalBuffer;
   multiBufferOptions.limitMixAutoMultiBufferBuffer =
       hivmPipelineOptions.limitAutoMultiBufferBuffer;
+  // Carry explicit overrides and the driver's per-space fallback decisions.
+  multiBufferOptions.disableMultiBufferOnUB =
+      hivmPipelineOptions.disableMultiBufferOnUB;
+  multiBufferOptions.disableMultiBufferOnL0C =
+      hivmPipelineOptions.disableMultiBufferOnL0C;
+  multiBufferOptions.disableMultiBufferOnL1 =
+      hivmPipelineOptions.disableMultiBufferOnL1;
   multiBufferOptions.workspaceMultiBufferNum =
       hivmPipelineOptions.setWorkspaceMultibuffer;
-  multiBufferOptions.enablePreload = hivmPipelineOptions.enablePreload;
+  multiBufferOptions.enablePreload =
+      hivmPipelineOptions.enablePreload ||
+      usesContinuousQueryUnroll(hivmPipelineOptions);
   // MarkTightlyCoupledBuffer before CVPipelining is only needed in Skew
   // (preload) mode: createNewLoopsForPreloadWithScopes uses TCB marks to
   // decide which local outputs bypass scope.return.  Running it for
   // standard CVPipelining causes migrateOps to clone the TCB-marked allocs
   // into work-item loops; those dead clones retain their marks and force
   // PlanMemory to allocate them as independent buffers, causing UB overflow.
-  if (hivmPipelineOptions.setCVPipelineMode == CVPipelineMode::Skew) {
+  if (hivmPipelineOptions.setCVPipelineMode == CVPipelineMode::Skew ||
+      usesContinuousQueryUnroll(hivmPipelineOptions)) {
     pm.nest<func::FuncOp>().addPass(createMarkTightlyCoupledBufferPass());
   }
   pm.addNestedPass<func::FuncOp>(createMarkMultiBufferPass(multiBufferOptions));
@@ -406,6 +421,20 @@ static void hivmPreBufferizationOptimizationPipeline(
   // broadcasts.
   canonicalizationHIVMPipeline(pm);
   pm.nest<func::FuncOp>().addPass(createInlineOTFBroadcastPass());
+  const bool enableAttentionBoundary =
+      hivmPipelineOptions.enableCVPAttentionFirstOutput ||
+      hivmPipelineOptions.enableCVPAttentionLastOutput ||
+      hivmPipelineOptions.enableCVPAttentionFirstState;
+  const bool enableAttentionContracts =
+      hivmPipelineOptions.enableCVPAttentionAnalysis ||
+      hivmPipelineOptions.enableCVPAttentionKeyMajor ||
+      hivmPipelineOptions.enableCVPAttentionScoreRematerialization ||
+      hivmPipelineOptions.enableCVPAttentionMaxScaling ||
+      hivmPipelineOptions.enableCVPAttentionRows2 || enableAttentionBoundary;
+  const bool prepareAttentionContracts =
+      enableAttentionContracts || hivmPipelineOptions.enableCVPQueryPipeline;
+  if (prepareAttentionContracts)
+    pm.nest<func::FuncOp>().addPass(createCVPAttentionPreparePass());
   if (hivmPipelineOptions.enableMixedCV) {
     // Software pipelining Cube and Vector operations
     if (hivmPipelineOptions.setCVPipelineMode != CVPipelineMode::Off) {
@@ -414,12 +443,46 @@ static void hivmPreBufferizationOptimizationPipeline(
           hivmPipelineOptions.setWorkspaceMultibuffer;
       pipelineOptions.enableLazyLoading = hivmPipelineOptions.enableLazyLoading;
       pipelineOptions.pipelineMode = hivmPipelineOptions.setCVPipelineMode;
+      pipelineOptions.annotateAttention = prepareAttentionContracts;
+      pipelineOptions.continuousQuery =
+          usesContinuousQueryUnroll(hivmPipelineOptions);
+      pipelineOptions.queryKeyUnroll = static_cast<unsigned>(
+          hivmPipelineOptions.cvpQueryKeyUnroll.getValue());
       pm.nest<func::FuncOp>().addPass(createCVPipeliningPass(pipelineOptions));
       pm.addNestedPass<func::FuncOp>(
           createMarkMultiBufferPass(multiBufferOptions));
     }
   }
 
+  if (prepareAttentionContracts) {
+    VerifyCVPAttentionOptions attentionOptions;
+    attentionOptions.retainProvenance =
+        hivmPipelineOptions.enableCVPAttentionKeyMajor ||
+        hivmPipelineOptions.enableCVPAttentionScoreRematerialization ||
+        hivmPipelineOptions.enableCVPAttentionMaxScaling ||
+        hivmPipelineOptions.enableCVPAttentionRows2 ||
+        enableAttentionBoundary || hivmPipelineOptions.enableCVPQueryPipeline;
+    attentionOptions.dropAnnotations =
+        !hivmPipelineOptions.enableCVPAttentionKeyMajor;
+    pm.nest<func::FuncOp>().addPass(
+        createVerifyCVPAttentionPass(attentionOptions));
+  }
+  if (hivmPipelineOptions.enableCVPAttentionKeyMajor) {
+    CVPAttentionLayoutOptions attentionOptions;
+    attentionOptions.allowFP32SumReassociation =
+        hivmPipelineOptions.allowCVPAttentionSumReassociation;
+    attentionOptions.requireMatch = true;
+    // Change Cube/fixpipe/vector/P/PV geometry together before subblock
+    // partitioning and global workspace or cross-core synchronization.
+    pm.addPass(createCVPAttentionLayoutPass(attentionOptions));
+  }
+  if (hivmPipelineOptions.enableCVPQueryPipeline) {
+    CVPQueryPipelineOptions queryOptions;
+    queryOptions.requireMatch = true;
+    // Preserve the original persistent core assignment while joining its
+    // query/key work before partitioning, workspace planning and core split.
+    pm.addPass(createCVPQueryPipelinePass(queryOptions));
+  }
   pm.addPass(createPartitionAndBindSubBlockPass());
   pm.nest<func::FuncOp>().addPass(createInferVFModePass());
 
@@ -606,19 +669,110 @@ static void hivmPostBufferizationOptimizationPipeline(
       hivmPipelineOptions.limitAutoMultiBufferOfLocalBuffer;
   multiBufferOptions.limitMixAutoMultiBufferBuffer =
       hivmPipelineOptions.limitAutoMultiBufferBuffer;
-  multiBufferOptions.enablePreload = hivmPipelineOptions.enablePreload;
+  // Local marking must use the same per-space policy as tensor marking.
+  multiBufferOptions.disableMultiBufferOnUB =
+      hivmPipelineOptions.disableMultiBufferOnUB;
+  multiBufferOptions.disableMultiBufferOnL0C =
+      hivmPipelineOptions.disableMultiBufferOnL0C;
+  multiBufferOptions.disableMultiBufferOnL1 =
+      hivmPipelineOptions.disableMultiBufferOnL1;
+  multiBufferOptions.enablePreload =
+      hivmPipelineOptions.enablePreload ||
+      usesContinuousQueryUnroll(hivmPipelineOptions);
   pm.nest<func::FuncOp>().addPass(
       createMarkMultiBufferPass(multiBufferOptions));
   PlanMemoryRegBaseOptions planMemoryOption;
   planMemoryOption.enablePrintMemoryAllocatedSize =
       hivmPipelineOptions.enablePrintMemoryAllocatedSize;
   planMemoryOption.simtVFDynamicSize = hivmPipelineOptions.simtVFDynamicSize;
+  // The scheduled query stream must never enter the cross-scope TCB reuse
+  // whitelist. The CLI diagnoses an unsafe explicit configuration; also keep
+  // direct pass-pipeline callers safe by construction.
   planMemoryOption.disableTightlyCoupledBufferReuse =
-      hivmPipelineOptions.disableTightlyCoupledBufferReuse;
+      hivmPipelineOptions.disableTightlyCoupledBufferReuse ||
+      hivmPipelineOptions.enableCVPQueryPipeline;
   planMemoryOption.disableVFReachableCheck =
       hivmPipelineOptions.disableVFReachableCheck;
   if (hivmPipelineOptions.enableVFOperandSubstitution) {
     pm.addPass(createVFOperandSubstitutionPass());
+  }
+  const bool enableAttentionBoundary =
+      hivmPipelineOptions.enableCVPAttentionFirstOutput ||
+      hivmPipelineOptions.enableCVPAttentionLastOutput ||
+      hivmPipelineOptions.enableCVPAttentionFirstState;
+  if (!hivmPipelineOptions.enableCVPAttentionKeyMajor &&
+      (hivmPipelineOptions.enableCVPAttentionScoreRematerialization ||
+       hivmPipelineOptions.enableCVPAttentionMaxScaling)) {
+    CVPAttentionVectorOptions attentionOptions;
+    attentionOptions.requireMatch = true;
+    attentionOptions.enableScoreRematerialization =
+        hivmPipelineOptions.enableCVPAttentionScoreRematerialization;
+    attentionOptions.enableMaxScaling =
+        hivmPipelineOptions.enableCVPAttentionMaxScaling;
+    attentionOptions.enableTritonKernelCompile =
+        hivmPipelineOptions.enableTritonKernelCompile;
+    attentionOptions.retainProvenance =
+        hivmPipelineOptions.enableCVPAttentionRows2 || enableAttentionBoundary;
+    pm.addPass(createCVPAttentionVectorPass(attentionOptions));
+  }
+  if (hivmPipelineOptions.cvpQCacheMode.getValue() != "none") {
+    CVPQCacheOptions cacheOptions;
+    cacheOptions.mode = hivmPipelineOptions.cvpQCacheMode.getValue();
+    cacheOptions.crossCoreSync =
+        !hivmPipelineOptions.disableAutoInjectBlockSync;
+    cacheOptions.unitFlagSync = hivmPipelineOptions.enableHIVMUnitFlagSync;
+    cacheOptions.requireMatch = true;
+    pm.addPass(createCVPQCachePass(cacheOptions));
+  }
+  if (enableAttentionBoundary) {
+    CVPAttentionBoundaryOptions attentionOptions;
+    attentionOptions.enableFirstOutput =
+        hivmPipelineOptions.enableCVPAttentionFirstOutput;
+    attentionOptions.enableLastOutput =
+        hivmPipelineOptions.enableCVPAttentionLastOutput;
+    attentionOptions.enableFirstState =
+        hivmPipelineOptions.enableCVPAttentionFirstState;
+    attentionOptions.requireMatch = true;
+    attentionOptions.retainProvenance =
+        hivmPipelineOptions.enableCVPAttentionRows2;
+    pm.addPass(createCVPAttentionBoundaryPass(attentionOptions));
+  }
+  if (hivmPipelineOptions.enableCVPAttentionRows2) {
+    CVPAttentionVectorScheduleOptions attentionOptions;
+    attentionOptions.requireMatch = true;
+    pm.addPass(createCVPAttentionVectorSchedulePass(attentionOptions));
+  }
+  // Boundary specialization can leave dead reset selectors and their views.
+  // Remove those uses before measuring buffer lifetimes and reserving UB.
+  if (hivmPipelineOptions.enableCVPQueryPipeline) {
+    pm.addPass(createCanonicalizerPass());
+    if (hivmPipelineOptions.enableCVPQueryStateCopyForward) {
+      pm.addPass(createCVPQueryStateCopyForwardPass());
+      pm.addPass(createCanonicalizerPass());
+    }
+    if (hivmPipelineOptions.enableCVPQueryFinalOutputForward) {
+      pm.addPass(createCVPQueryFinalOutputForwardPass());
+      pm.addPass(createCanonicalizerPass());
+    }
+    if (hivmPipelineOptions.enableCVPQueryOutputCopyForward) {
+      CVPQueryOutputCopyForwardOptions options;
+      options.requireMatch = true;
+      pm.addPass(createCVPQueryOutputCopyForwardPass(options));
+      pm.addPass(createCanonicalizerPass());
+    }
+    if (hivmPipelineOptions.enableCVPQueryScalarInputForward) {
+      CVPQueryScalarInputForwardOptions options;
+      options.requireMatch = true;
+      pm.addPass(createCVPQueryScalarInputForwardPass(options));
+      pm.addPass(createCanonicalizerPass());
+    }
+  }
+  if (hivmPipelineOptions.enableCVPAttentionHalfPStream) {
+    CVPAttentionPStreamOptions options;
+    options.allowSumReassociation =
+        hivmPipelineOptions.allowCVPAttentionSumReassociation;
+    options.requireMatch = true;
+    pm.addPass(createCVPAttentionPStreamPass(options));
   }
   planMemoryOption.planMemoryStrategy = hivmPipelineOptions.planMemoryStrategy;
   pm.addPass(createPlanMemoryRegBasePass(planMemoryOption));
@@ -634,7 +788,8 @@ static void hivmPostBufferizationOptimizationPipeline(
   syncBlockLockPipeline(pm, SyncBlockLockPipelinePhase::Prepare);
   pm.addPass(createInferHIVMMemScopePass());
   // Preload code transformation for CV pipelining
-  if (hivmPipelineOptions.enablePreload) {
+  if (hivmPipelineOptions.enablePreload ||
+      usesContinuousQueryUnroll(hivmPipelineOptions)) {
     pm.addPass(createCreatePreloadPass());
   }
   // Intra-Core Auto-Sync passes (Inject-Sync, GSS)

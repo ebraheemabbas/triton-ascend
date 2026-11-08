@@ -17,6 +17,7 @@
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HACC/Utils/Utils.h"
+#include "bishengir/Dialect/HIVM/Analysis/CVPAttentionPlan.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
@@ -389,9 +390,9 @@ func::FuncOp InsertAnchorsAndBackupPass::backupFunc(func::FuncOp src) {
   backup->setAttr(hivm::BackupFunctionAttr::name, builder.getUnitAttr());
 
   // Restrict the backup to passes whose argument names appear in
-  // `annotation.filter_passes`. Only this pass and the delayed cross-core GSS
-  // pass should rewrite the backup; every other pass in the pipeline must skip
-  // it via BiShengIRPassManager's filtering action handler.
+  // `annotation.filter_passes`. The listed infrastructure passes maintain the
+  // frozen graph consumed by delayed cross-core GSS. An attention proof may
+  // inspect that graph, but must preserve the entire backup unchanged.
   std::string insertAnchorsAndBackupPassName = this->getArgument().str();
   auto delayedCrossCoreGSSPass = createDelayedCrossCoreGSSPass();
   std::string delayedCrossCoreGSSPassName =
@@ -402,6 +403,12 @@ func::FuncOp InsertAnchorsAndBackupPass::backupFunc(func::FuncOp src) {
   std::string allPassesNames = insertAnchorsAndBackupPassName + "," +
                                delayedCrossCoreGSSPassName + "," +
                                splitSimtModulePassName;
+
+  // Module passes cannot inspect filtered children: BiShengIRPassManager
+  // temporarily removes them. The distinct-score proof needs the original
+  // QK/P ownership graph, so expose it read-only for verified attention.
+  if (src->hasAttr(kCVPAttentionVerifiedAttr))
+    allPassesNames += "," + createCVPAttentionVectorPass()->getArgument().str();
 
   auto attr = mlir::annotation::FilterPassesAttr::get(
       ctx, StringAttr::get(ctx, allPassesNames));

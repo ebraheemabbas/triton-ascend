@@ -61,6 +61,19 @@ add_bishengir_dialect_library(BiShengIRHIVMTransforms
   ConvertLayout/Propagate/PropagateConvertLayoutVBrc.cpp
   CreatePreload.cpp
   CVPipelining.cpp
+  regbase/CVPAttentionPrepare.cpp
+  regbase/CVPAttentionLayout.cpp
+  regbase/CVPQueryPipeline.cpp
+  regbase/CVPQuerySchedule.cpp
+  regbase/CVPQueryOutputStorage.cpp
+  regbase/CVPQueryStateStorage.cpp
+  regbase/CVPQueryStateCopyForward.cpp
+  regbase/CVPQCache.cpp
+  regbase/CVPAttentionQueryVector.cpp
+  regbase/CVPAttentionVector.cpp
+  regbase/CVPAttentionVectorSchedule.cpp
+  regbase/CVPAttentionPStream.cpp
+  regbase/CVPAttentionBoundary.cpp
   EnableHIVMCCompatiblePrint.cpp
   EnableMultiBuffer.cpp
   FlattenOps.cpp
@@ -157,6 +170,8 @@ add_bishengir_dialect_library(BiShengIRHIVMTransforms
   MLIRAffineTransforms
   MLIRArithDialect
   MLIRArithUtils
+  MLIRAVEDialect
+  MLIRAVEUtils
   BiShengIRAnnotationDialect
   MLIRBufferizationDialect
   MLIRBufferizationTransforms
@@ -167,6 +182,7 @@ add_bishengir_dialect_library(BiShengIRHIVMTransforms
   BiShengIRHACCDialect
   BiShengIRHIVMAnalysis
   BiShengIRHIVMDialect
+  BiShengIRHFusionDialect
   BiShengIRScopeDialect
   MLIRIR
   MLIRLinalgDialect

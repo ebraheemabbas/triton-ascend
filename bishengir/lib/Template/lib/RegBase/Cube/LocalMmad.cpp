@@ -44,7 +44,7 @@ __aicore__ inline uint32_t getL1MmadPingPongId() {
 }
 
 template <class ElementA, class ElementB, class ElementBias, class ElementACC,
-          bool TA, bool TB, bool HF32>
+          bool TA, bool TB, bool HF32, bool BankedReady = false>
 CATLASS_DEVICE void
 L1Mmad(__cc__ ElementACC *l0C, __cbuf__ ElementA *l1A, __cbuf__ ElementB *l1B,
        __cbuf__ ElementBias *l1Bias, uint32_t l1M, uint32_t l1K, uint32_t l1N,
@@ -96,10 +96,10 @@ L1Mmad(__cc__ ElementACC *l0C, __cbuf__ ElementA *l1A, __cbuf__ ElementB *l1B,
   CopyL1ToL0B copyL1ToL0B;
 
   AscendCBisheng::LocalTensor<ElementA> l1ATensor{
-      AscendCBisheng::TPosition::A1, (uint32_t) reinterpret_cast<int64_t>(l1A),
+      AscendCBisheng::TPosition::A1, (uint32_t)reinterpret_cast<int64_t>(l1A),
       l1M * l1K};
   AscendCBisheng::LocalTensor<ElementB> l1BTensor{
-      AscendCBisheng::TPosition::A1, (uint32_t) reinterpret_cast<int64_t>(l1B),
+      AscendCBisheng::TPosition::A1, (uint32_t)reinterpret_cast<int64_t>(l1B),
       l1K * l1N};
   AscendCBisheng::LocalTensor<ElementA> l0ATensor{AscendCBisheng::TPosition::A2,
                                                   0, ArchTag::L0A_SIZE};
@@ -108,7 +108,7 @@ L1Mmad(__cc__ ElementACC *l0C, __cbuf__ ElementA *l1A, __cbuf__ ElementB *l1B,
   AscendCBisheng::LocalTensor<ElementACC> bTTensor{
       AscendCBisheng::TPosition::C2, 0, ArchTag::BIAS_SIZE};
   AscendCBisheng::LocalTensor<ElementACC> l0CTensor{
-      AscendCBisheng::TPosition::CO1, (uint32_t) reinterpret_cast<int64_t>(l0C),
+      AscendCBisheng::TPosition::CO1, (uint32_t)reinterpret_cast<int64_t>(l0C),
       l1M * l1N};
 
   auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1A>(l1M, l1K);
@@ -207,7 +207,7 @@ L1Mmad(__cc__ ElementACC *l0C, __cbuf__ ElementA *l1A, __cbuf__ ElementB *l1B,
       if (hasBias && initC) {
         AscendCBisheng::LocalTensor<ElementBias> l1BiasTensor{
             AscendCBisheng::TPosition::A1,
-            (uint32_t) reinterpret_cast<int64_t>(l1Bias), actualN};
+            (uint32_t)reinterpret_cast<int64_t>(l1Bias), actualN};
         auto layoutBiasInL1 = tla::MakeLayout(actualN);
         auto tensorL1Bias =
             tla::MakeTensor(l1BiasTensor, layoutBiasInL1, Arch::PositionL1{});
@@ -234,8 +234,11 @@ L1Mmad(__cc__ ElementACC *l0C, __cbuf__ ElementA *l1A, __cbuf__ ElementB *l1B,
     }
 
     // Notify to do mmad
-    AscendCBisheng::SetFlag<AscendCBisheng::HardEvent::MTE1_M>(EVENT_ID0);
-    AscendCBisheng::WaitFlag<AscendCBisheng::HardEvent::MTE1_M>(EVENT_ID0);
+    // The banked policy requires the caller's complete event/resource
+    // contract. Legacy entries retain the serialized event-zero policy.
+    const uint32_t readyEventId = BankedReady ? l0EventId : EVENT_ID0;
+    AscendCBisheng::SetFlag<AscendCBisheng::HardEvent::MTE1_M>(readyEventId);
+    AscendCBisheng::WaitFlag<AscendCBisheng::HardEvent::MTE1_M>(readyEventId);
 
     // If the unit flag is enabled, the unit flag is set according to the
     // calculation progress
@@ -277,7 +280,7 @@ L1Mmad(__cc__ ElementACC *l0C, __cbuf__ ElementA *l1A, __cbuf__ ElementB *l1B,
 } // namespace Catlass::Gemm
 
 template <typename SRC_TYPE, typename DST_TYPE, typename BIAS_TYPE, bool TA,
-          bool TB, bool HF32>
+          bool TB, bool HF32, bool BankedReady = false>
 __aicore__ __attribute__((always_inline)) void
 mma_tile_core(memref_t<__cbuf__ SRC_TYPE, 4> *ma,
               memref_t<__cbuf__ SRC_TYPE, 4> *mb, bool init, int64_t m,
@@ -323,7 +326,8 @@ mma_tile_core(memref_t<__cbuf__ SRC_TYPE, 4> *ma,
     }
   }
 
-  Catlass::Gemm::L1Mmad<SRC_TYPE, SRC_TYPE, BIAS_TYPE, DST_TYPE, TA, TB, HF32>(
+  Catlass::Gemm::L1Mmad<SRC_TYPE, SRC_TYPE, BIAS_TYPE, DST_TYPE, TA, TB, HF32,
+                        BankedReady>(
       mc->aligned + mc->offset, // l0C
       ma->aligned + ma->offset, // l1A
       mb->aligned + mb->offset, // l1B
@@ -918,4 +922,402 @@ REGISTER_MMA_TILE_BIAS_HF32(cbuf, cc, 4, float, float, float);
 REGISTER_MMA_TILE_BIAS_TA_HF32(cbuf, cc, 4, float, float, float);
 REGISTER_MMA_TILE_BIAS_TB_HF32(cbuf, cc, 4, float, float, float);
 REGISTER_MMA_TILE_BIAS_TA_TB_HF32(cbuf, cc, 4, float, float, float);
+}
+
+// CVPipeline cached-Q and neutral adapters are deliberately compiled in this
+// same translation unit as the generic matrix helper. They must share its
+// actual getL1MmadPingPongId state after linking; native validation checks it.
+// Legacy entries keep their original readiness policy. Banked-ready entries
+// additionally require the caller's event and resource ownership contract.
+// Resource ranges and supported geometry are checked before lowering.
+#include "bishengir/Dialect/Utils/CVPCubeResourcePlan.h"
+
+namespace Catlass::Gemm {
+template <class ElementA, class ElementB, class ElementBias, class ElementACC,
+          bool TA, bool TB, bool HF32, bool BankedReady = false>
+CATLASS_DEVICE void
+L1MmadCVPQCache(__cc__ ElementACC *l0C, __cbuf__ ElementA *l1A,
+                __cbuf__ ElementB *l1B, __cbuf__ ElementBias *l1Bias,
+                uint32_t l1M, uint32_t l1K, uint32_t l1N, uint32_t actualM,
+                uint32_t actualK, uint32_t actualN, uint32_t l1AMTE2MTE1EventId,
+                uint32_t l1AMTE1MTE2EventId, uint32_t l1BMTE2MTE1EventId,
+                uint32_t l1BMTE1MTE2EventId, bool isL1FirstK, bool isL1LastK,
+                UNIT_FLAG unit_flag_mode, bool hasBias, bool copyB,
+                uint32_t cacheBByteOffset) {
+  if constexpr (HF32) {
+    AscendCBisheng::SetHF32Mode(true);
+  }
+
+  using ArchTag = Arch::AtlasA5;
+  static_assert(ArchTag::L0A_SIZE == bishengir::cvp::kA5L0ABytes);
+  static_assert(ArchTag::L0B_SIZE == bishengir::cvp::kA5L0BBytes);
+  static_assert(sizeof(ElementA) == 2 && sizeof(ElementB) == 2);
+  static_assert(C0_NUM_PER_FRACTAL == bishengir::cvp::kFractalElements);
+  static_assert(static_cast<uint8_t>(UNIT_FLAG::DISABLED) == 0);
+
+  using LayoutTagL1A = typename TransToTag<TA>::tag;
+  using LayoutTagL1B = typename TransToTag<TB>::tag;
+  using LayoutTagL0A = layout::zN;
+  using LayoutTagL0B = layout::nZ;
+
+  using LayoutL1A = detail::TagToLayout_t<ElementA, LayoutTagL1A>;
+  using LayoutL1B = detail::TagToLayout_t<ElementB, LayoutTagL1B>;
+  using LayoutL0A = detail::TagToLayout_t<ElementA, LayoutTagL0A>;
+  using LayoutL0B = detail::TagToLayout_t<ElementB, LayoutTagL0B>;
+  using LayoutL0C = typename detail::LayoutL0C;
+
+  using L1AAlignHelper = Gemm::helper::L1AlignHelper<ElementA, LayoutTagL1A>;
+  using L1BAlignHelper = Gemm::helper::L1AlignHelper<ElementB, LayoutTagL1B>;
+
+  using TensorL1A =
+      tla::Tensor<AscendCBisheng::LocalTensor<ElementA>, LayoutL1A,
+                  tla::Coord<tla::_0, tla::_0>, AscendCBisheng::TPosition::A1>;
+  using TensorL1B =
+      tla::Tensor<AscendCBisheng::LocalTensor<ElementB>, LayoutL1B,
+                  tla::Coord<tla::_0, tla::_0>, AscendCBisheng::TPosition::A1>;
+  using TensorL0A =
+      tla::Tensor<AscendCBisheng::LocalTensor<ElementA>, LayoutL0A,
+                  tla::Coord<tla::_0, tla::_0>, AscendCBisheng::TPosition::A2>;
+  using TensorL0B =
+      tla::Tensor<AscendCBisheng::LocalTensor<ElementB>, LayoutL0B,
+                  tla::Coord<tla::_0, tla::_0>, AscendCBisheng::TPosition::B2>;
+  using TensorL0C =
+      tla::Tensor<AscendCBisheng::LocalTensor<ElementACC>, LayoutL0C,
+                  tla::Coord<tla::_0, tla::_0>, AscendCBisheng::TPosition::CO1>;
+  using CopyL1ToL0A = Gemm::Tile::TileCopyTla<ArchTag, TensorL1A, TensorL0A>;
+  using CopyL1ToL0B = Gemm::Tile::TileCopyTla<ArchTag, TensorL1B, TensorL0B>;
+  using TileMmad = Gemm::Tile::TileMmadTla<ArchTag, ElementA, LayoutTagL1A>;
+
+  TileMmad tileMmad;
+  CopyL1ToL0A copyL1ToL0A;
+  CopyL1ToL0B copyL1ToL0B;
+
+  AscendCBisheng::LocalTensor<ElementA> l1ATensor{
+      AscendCBisheng::TPosition::A1, (uint32_t)reinterpret_cast<int64_t>(l1A),
+      l1M * l1K};
+  AscendCBisheng::LocalTensor<ElementB> l1BTensor{
+      AscendCBisheng::TPosition::A1, (uint32_t)reinterpret_cast<int64_t>(l1B),
+      l1K * l1N};
+  AscendCBisheng::LocalTensor<ElementA> l0ATensor{AscendCBisheng::TPosition::A2,
+                                                  0, ArchTag::L0A_SIZE};
+  AscendCBisheng::LocalTensor<ElementB> l0BTensor{AscendCBisheng::TPosition::B2,
+                                                  0, ArchTag::L0B_SIZE};
+  AscendCBisheng::LocalTensor<ElementACC> bTTensor{
+      AscendCBisheng::TPosition::C2, 0, ArchTag::BIAS_SIZE};
+  AscendCBisheng::LocalTensor<ElementACC> l0CTensor{
+      AscendCBisheng::TPosition::CO1, (uint32_t)reinterpret_cast<int64_t>(l0C),
+      l1M * l1N};
+
+  auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1A>(l1M, l1K);
+  auto tensorL1A = tla::MakeTensor(l1ATensor, layoutAInL1, Arch::PositionL1{});
+  auto layoutBInL1 = tla::MakeLayout<ElementB, LayoutTagL1B>(l1K, l1N);
+  auto tensorL1B = tla::MakeTensor(l1BTensor, layoutBInL1, Arch::PositionL1{});
+  auto layoutInL0C = tla::MakeLayoutL0C(actualM, actualN);
+  auto tensorL0C = tla::MakeTensor(l0CTensor, layoutInL0C, Arch::PositionL0C{});
+
+  constexpr uint32_t L0A_PINGPONG_BUF_SIZE = ArchTag::L0A_SIZE / 2;
+  constexpr uint32_t L0B_PINGPONG_BUF_SIZE = ArchTag::L0B_SIZE / 2;
+  constexpr uint32_t BT_PINGPONG_BUF_SIZE = ArchTag::BIAS_SIZE / 2;
+  constexpr uint32_t L0A_ELE_NUM_PER_C0 = BYTE_PER_C0 / sizeof(ElementA);
+  constexpr uint32_t L0B_ELE_NUM_PER_C0 = BYTE_PER_C0 / sizeof(ElementB);
+
+  // Bias Table half selected with L0 ping-pong; guarded by the same M_MTE1
+  // event.
+  AscendCBisheng::LocalTensor<ElementACC> btTile = bTTensor;
+
+  bool enableDoubleBuffer = true;
+  uint32_t l0K = RoundDown<C0_NUM_PER_FRACTAL>(
+      min(L0A_PINGPONG_BUF_SIZE / sizeof(ElementA) /
+              RoundUp<L1AAlignHelper::M_ALIGNED>(actualM) / L0A_ELE_NUM_PER_C0 *
+              L0A_ELE_NUM_PER_C0,
+          L0B_PINGPONG_BUF_SIZE / sizeof(ElementB) /
+              RoundUp<L1BAlignHelper::N_ALIGNED>(actualN) / L0B_ELE_NUM_PER_C0 *
+              L0B_ELE_NUM_PER_C0));
+  if (l0K == 0) {
+    enableDoubleBuffer = false;
+    l0K = RoundDown<C0_NUM_PER_FRACTAL>(
+        min(2 * L0A_PINGPONG_BUF_SIZE / sizeof(ElementA) /
+                RoundUp<L1AAlignHelper::M_ALIGNED>(actualM) /
+                L0A_ELE_NUM_PER_C0 * L0A_ELE_NUM_PER_C0,
+            2 * L0B_PINGPONG_BUF_SIZE / sizeof(ElementB) /
+                RoundUp<L1BAlignHelper::N_ALIGNED>(actualN) /
+                L0B_ELE_NUM_PER_C0 * L0B_ELE_NUM_PER_C0));
+  }
+
+  uint32_t kL0Loop = CeilDiv(actualK, l0K);
+
+  for (int kL0Idx = 0; kL0Idx < kL0Loop; kL0Idx++) {
+    uint32_t kL0Actual =
+        (kL0Idx < kL0Loop - 1) ? l0K : (actualK - kL0Idx * l0K);
+
+    // Get ping/pong id (0 or 1)
+    uint32_t pingPongId = enableDoubleBuffer ? getL1MmadPingPongId() : 0;
+    uint32_t l0EventId = !pingPongId ? EVENT_ID0 : EVENT_ID1;
+
+    // Locate the current tile on L0A
+    auto l0ATile =
+        l0ATensor[pingPongId * L0A_PINGPONG_BUF_SIZE / sizeof(ElementA)];
+    auto layoutAInL0 =
+        tla::MakeLayout<ElementA, LayoutTagL0A>(actualM, kL0Actual);
+    auto tensorL0A = tla::MakeTensor(l0ATile, layoutAInL0, Arch::PositionL0A{});
+    // Locate the current tile of matrix A on L1
+    auto tensorTileL1A = GetTile(tensorL1A, tla::MakeCoord(0, kL0Idx * l0K),
+                                 tla::MakeShape(actualM, kL0Actual));
+
+    // Wait for mmad finished
+    AscendCBisheng::WaitFlag<AscendCBisheng::HardEvent::M_MTE1>(l0EventId);
+
+    if (kL0Idx == 0 && l1AMTE2MTE1EventId != -1) {
+      AscendCBisheng::WaitFlag<AscendCBisheng::HardEvent::MTE2_MTE1>(
+          l1AMTE2MTE1EventId);
+    }
+    // Load current tile from L1 to L0A
+    copyL1ToL0A(tensorL0A, tensorTileL1A);
+    if (kL0Idx == kL0Loop - 1 && l1AMTE1MTE2EventId != -1) {
+      AscendCBisheng::SetFlag<AscendCBisheng::HardEvent::MTE1_MTE2>(
+          l1AMTE1MTE2EventId);
+    }
+
+    // Locate the current tile on L0B
+    auto l0BTile = l0BTensor[cacheBByteOffset / sizeof(ElementB)];
+    auto layoutBInL0 =
+        tla::MakeLayout<ElementB, LayoutTagL0B>(kL0Actual, actualN);
+    auto tensorL0B = tla::MakeTensor(l0BTile, layoutBInL0, Arch::PositionL0B{});
+    // Locate the current tile of matrix B on L1
+    auto tensorTileL1B = GetTile(tensorL1B, tla::MakeCoord(kL0Idx * l0K, 0),
+                                 tla::MakeShape(kL0Actual, actualN));
+
+    if (kL0Idx == 0 && l1BMTE2MTE1EventId != -1) {
+      AscendCBisheng::WaitFlag<AscendCBisheng::HardEvent::MTE2_MTE1>(
+          l1BMTE2MTE1EventId);
+    }
+    // Load current tile from L1 to L0B
+    if (copyB)
+      copyL1ToL0B(tensorL0B, tensorTileL1B);
+    if (kL0Idx == kL0Loop - 1 && l1BMTE1MTE2EventId != -1) {
+      AscendCBisheng::SetFlag<AscendCBisheng::HardEvent::MTE1_MTE2>(
+          l1BMTE1MTE2EventId);
+    }
+
+    bool initC = isL1FirstK && (kL0Idx == 0);
+    if constexpr (!std::is_void_v<ElementBias>) {
+      if (hasBias && initC) {
+        AscendCBisheng::LocalTensor<ElementBias> l1BiasTensor{
+            AscendCBisheng::TPosition::A1,
+            (uint32_t)reinterpret_cast<int64_t>(l1Bias), actualN};
+        auto layoutBiasInL1 = tla::MakeLayout(actualN);
+        auto tensorL1Bias =
+            tla::MakeTensor(l1BiasTensor, layoutBiasInL1, Arch::PositionL1{});
+        // Ping-pong Bias Table with L0; Wait/Set(l0EventId) already covers this
+        // half.
+        btTile =
+            bTTensor[pingPongId * BT_PINGPONG_BUF_SIZE / sizeof(ElementACC)];
+        auto layoutBiasInBT = tla::MakeLayout(actualN);
+        auto tensorL0Bias =
+            tla::MakeTensor(btTile, layoutBiasInBT, Arch::PositionBias{});
+        using TensorL1Bias = tla::Tensor<
+            AscendCBisheng::LocalTensor<ElementBias>,
+            detail::TagToLayout_t<ElementBias, layout::VectorLayout>,
+            tla::Coord<tla::_0>, AscendCBisheng::TPosition::A1>;
+        using TensorL0Bias =
+            tla::Tensor<AscendCBisheng::LocalTensor<ElementACC>,
+                        detail::TagToLayout_t<ElementACC, layout::VectorLayout>,
+                        tla::Coord<tla::_0>, AscendCBisheng::TPosition::C2>;
+        using CopyL1ToBT =
+            Gemm::Tile::TileCopyTla<ArchTag, TensorL1Bias, TensorL0Bias>;
+        CopyL1ToBT copyL1ToBT;
+        copyL1ToBT(tensorL0Bias, tensorL1Bias);
+      }
+    }
+
+    // Notify to do mmad
+    // The banked policy requires the caller's complete event/resource
+    // contract. Legacy entries retain the serialized event-zero policy.
+    const uint32_t readyEventId = BankedReady ? l0EventId : EVENT_ID0;
+    AscendCBisheng::SetFlag<AscendCBisheng::HardEvent::MTE1_M>(readyEventId);
+    AscendCBisheng::WaitFlag<AscendCBisheng::HardEvent::MTE1_M>(readyEventId);
+
+    // If the unit flag is enabled, the unit flag is set according to the
+    // calculation progress
+    UNIT_FLAG curUnitFlagMode = UNIT_FLAG::DISABLED;
+    if (unit_flag_mode != UNIT_FLAG::DISABLED) {
+      if (isL1LastK && (kL0Idx == kL0Loop - 1)) {
+        curUnitFlagMode = unit_flag_mode;
+      } else {
+        curUnitFlagMode = UNIT_FLAG::ENABLED_WITHOUT_UPDATE;
+      }
+    }
+    auto unitFlag = static_cast<uint8_t>(curUnitFlagMode);
+
+    if (hasBias) {
+      if (initC) {
+        auto layoutBiasInBT = tla::MakeLayout(actualN);
+        auto tensorL0Bias =
+            tla::MakeTensor(btTile, layoutBiasInBT, Arch::PositionBias{});
+        tileMmad(tensorL0C, tensorL0A, tensorL0B, tensorL0Bias, actualM,
+                 actualN, kL0Actual, initC, unitFlag);
+      } else {
+        tileMmad(tensorL0C, tensorL0A, tensorL0B, actualM, actualN, kL0Actual,
+                 initC, unitFlag);
+      }
+    } else {
+      tileMmad(tensorL0C, tensorL0A, tensorL0B, actualM, actualN, kL0Actual,
+               initC, unitFlag);
+    }
+
+    // Notify to move the next L0B tile
+    AscendCBisheng::SetFlag<AscendCBisheng::HardEvent::M_MTE1>(l0EventId);
+  }
+
+  if constexpr (HF32) {
+    AscendCBisheng::SetHF32Mode(false);
+  }
+}
+
+} // namespace Catlass::Gemm
+
+template <typename SRC_TYPE, typename DST_TYPE, typename BIAS_TYPE, bool TA,
+          bool TB, bool HF32, bool BankedReady = false>
+__aicore__ __attribute__((always_inline)) void mma_tile_core_cvp_qcache(
+    memref_t<__cbuf__ SRC_TYPE, 4> *ma, memref_t<__cbuf__ SRC_TYPE, 4> *mb,
+    bool init, int64_t m, int64_t k, int64_t n,
+    memref_t<__cc__ DST_TYPE, 4> *mc, int64_t mmad_l1_wait_l1a_event,
+    int64_t mmad_l1_wait_l1b_event, int64_t l1a_wait_mmad_l1_event,
+    int64_t l1b_wait_mmad_l1_event, int64_t kloop_db_cond,
+    int64_t back_pipe_m_pipe_mte1_db_event0,
+    int64_t back_pipe_m_pipe_mte1_db_event1, UNIT_FLAG unit_flag_mode,
+    int64_t unit_flag_group_id, bool copyB, int64_t cacheBByteOffset) {
+  uint32_t l1M =
+      TA ? (ma->sizes[0] * ma->sizes[3]) : (ma->sizes[1] * ma->sizes[2]);
+  uint32_t l1K =
+      TA ? (ma->sizes[1] * ma->sizes[2]) : (ma->sizes[0] * ma->sizes[3]);
+  uint32_t l1N =
+      TB ? (mb->sizes[1] * mb->sizes[2]) : (mb->sizes[0] * mb->sizes[3]);
+  uint32_t actualM = m;
+  uint32_t actualK = k;
+  uint32_t actualN = n;
+
+  int64_t l0c_n_size = mc->sizes[0] * mc->sizes[3];
+  int64_t l0c_m_size = mc->sizes[1] * mc->sizes[2];
+
+  if (unit_flag_mode != UNIT_FLAG::DISABLED) {
+    auto &unit_flag_was_disable = getUnitFlagDisableStatus(unit_flag_group_id);
+    // When unit_flag is enabled, matmul may act as consumer for previous
+    // fixpipe, unit_flag_was_disable means previous fixpipe will disable
+    // unit-flag, so conservatively add FIX->M set/wait pair
+    if (unit_flag_was_disable) {
+      INTRINSIC(set_flag, PIPE_FIX, PIPE_M, LIB_EVENT_ID0);
+      INTRINSIC(wait_flag, PIPE_FIX, PIPE_M, LIB_EVENT_ID0);
+    }
+    if (unit_flag_mode == UNIT_FLAG::ENABLED_WITHOUT_UPDATE) {
+      if (unit_flag_was_disable) {
+        unit_flag_was_disable = false;
+        unit_flag_mode = UNIT_FLAG::DISABLED;
+      }
+    } else if (unit_flag_mode == UNIT_FLAG::ENABLED_WITH_UPDATE) {
+      unit_flag_was_disable = false;
+      if ((actualN != l0c_n_size) || (actualM != l0c_m_size)) {
+        unit_flag_was_disable = true;
+        unit_flag_mode = UNIT_FLAG::ENABLED_WITHOUT_UPDATE;
+      }
+    }
+  }
+
+  Catlass::Gemm::L1MmadCVPQCache<SRC_TYPE, SRC_TYPE, BIAS_TYPE, DST_TYPE, TA,
+                                 TB, HF32, BankedReady>(
+      mc->aligned + mc->offset, // l0C
+      ma->aligned + ma->offset, // l1A
+      mb->aligned + mb->offset, // l1B
+      nullptr,                  // l1Bias
+      l1M,                      // l1M
+      l1K,                      // l1K
+      l1N,                      // l1N
+      actualM,                  // actualM
+      actualK,                  // actualK
+      actualN,                  // actualN
+      mmad_l1_wait_l1a_event,   // l1AMTE2MTE1EventId
+      l1a_wait_mmad_l1_event,   // l1AMTE1MTE2EventId
+      mmad_l1_wait_l1b_event,   // l1BMTE2MTE1EventId
+      l1b_wait_mmad_l1_event,   // l1BMTE1MTE2EventId
+      init,                     // isL1FirstK
+      true,                     // isL1LastK
+      unit_flag_mode,           // unit_flag_mode
+      false,                    // hasBias
+      copyB, static_cast<uint32_t>(cacheBByteOffset));
+}
+
+extern "C" __aicore__ __attribute__((always_inline)) void
+_mlir_ciface_mma_tile_cvp_qcache_qk_neutral_v1_half_to_float_tb(
+    memref_t<__cbuf__ half, 4> *a, memref_t<__cbuf__ half, 4> *b, bool init,
+    int64_t m, int64_t k, int64_t n, memref_t<__cc__ float, 4> *c,
+    int64_t waitA, int64_t waitB, int64_t releaseA, int64_t releaseB,
+    int64_t kloopDb, int64_t backEvent0, int64_t backEvent1, UNIT_FLAG unitFlag,
+    int64_t unitGroup) {
+  mma_tile_core<half, float, float, false, true, false>(
+      a, b, init, m, k, n, c, waitA, waitB, releaseA, releaseB, kloopDb,
+      backEvent0, backEvent1, unitFlag, unitGroup);
+}
+
+extern "C" __aicore__ __attribute__((always_inline)) void
+_mlir_ciface_mma_tile_cvp_qcache_qk_cached_v1_half_to_float_tb(
+    memref_t<__cbuf__ half, 4> *a, memref_t<__cbuf__ half, 4> *b, bool init,
+    int64_t m, int64_t k, int64_t n, memref_t<__cc__ float, 4> *c,
+    int64_t waitA, int64_t waitB, int64_t releaseA, int64_t releaseB,
+    int64_t kloopDb, int64_t backEvent0, int64_t backEvent1, UNIT_FLAG unitFlag,
+    int64_t unitGroup, bool copyB, int64_t cacheBByteOffset) {
+  mma_tile_core_cvp_qcache<half, float, float, false, true, false>(
+      a, b, init, m, k, n, c, waitA, waitB, releaseA, releaseB, kloopDb,
+      backEvent0, backEvent1, unitFlag, unitGroup, copyB, cacheBByteOffset);
+}
+
+extern "C" __aicore__ __attribute__((always_inline)) void
+_mlir_ciface_mma_tile_cvp_qcache_pv_v1_half_to_float_ta(
+    memref_t<__cbuf__ half, 4> *a, memref_t<__cbuf__ half, 4> *b, bool init,
+    int64_t m, int64_t k, int64_t n, memref_t<__cc__ float, 4> *c,
+    int64_t waitA, int64_t waitB, int64_t releaseA, int64_t releaseB,
+    int64_t kloopDb, int64_t backEvent0, int64_t backEvent1, UNIT_FLAG unitFlag,
+    int64_t unitGroup) {
+  mma_tile_core<half, float, float, true, false, false>(
+      a, b, init, m, k, n, c, waitA, waitB, releaseA, releaseB, kloopDb,
+      backEvent0, backEvent1, unitFlag, unitGroup);
+}
+
+// Explicit normal-library entry points for bank-specific MTE1-to-M readiness.
+// They preserve the legacy ABI and share the existing Catlass counter with the
+// cached and neutral matrix paths. Lowering must establish the caller-side
+// event/range/generation contract before selecting these entries.
+extern "C" __aicore__ __attribute__((always_inline)) void
+_mlir_ciface_mma_tile_cvp_qcache_qk_neutral_bank_ready_v1_half_to_float_tb(
+    memref_t<__cbuf__ half, 4> *a, memref_t<__cbuf__ half, 4> *b, bool init,
+    int64_t m, int64_t k, int64_t n, memref_t<__cc__ float, 4> *c,
+    int64_t waitA, int64_t waitB, int64_t releaseA, int64_t releaseB,
+    int64_t kloopDb, int64_t backEvent0, int64_t backEvent1, UNIT_FLAG unitFlag,
+    int64_t unitGroup) {
+  mma_tile_core<half, float, float, false, true, false, true>(
+      a, b, init, m, k, n, c, waitA, waitB, releaseA, releaseB, kloopDb,
+      backEvent0, backEvent1, unitFlag, unitGroup);
+}
+
+extern "C" __aicore__ __attribute__((always_inline)) void
+_mlir_ciface_mma_tile_cvp_qcache_qk_cached_bank_ready_v1_half_to_float_tb(
+    memref_t<__cbuf__ half, 4> *a, memref_t<__cbuf__ half, 4> *b, bool init,
+    int64_t m, int64_t k, int64_t n, memref_t<__cc__ float, 4> *c,
+    int64_t waitA, int64_t waitB, int64_t releaseA, int64_t releaseB,
+    int64_t kloopDb, int64_t backEvent0, int64_t backEvent1, UNIT_FLAG unitFlag,
+    int64_t unitGroup, bool copyB, int64_t cacheBByteOffset) {
+  mma_tile_core_cvp_qcache<half, float, float, false, true, false, true>(
+      a, b, init, m, k, n, c, waitA, waitB, releaseA, releaseB, kloopDb,
+      backEvent0, backEvent1, unitFlag, unitGroup, copyB, cacheBByteOffset);
+}
+
+extern "C" __aicore__ __attribute__((always_inline)) void
+_mlir_ciface_mma_tile_cvp_qcache_pv_bank_ready_v1_half_to_float_ta(
+    memref_t<__cbuf__ half, 4> *a, memref_t<__cbuf__ half, 4> *b, bool init,
+    int64_t m, int64_t k, int64_t n, memref_t<__cc__ float, 4> *c,
+    int64_t waitA, int64_t waitB, int64_t releaseA, int64_t releaseB,
+    int64_t kloopDb, int64_t backEvent0, int64_t backEvent1, UNIT_FLAG unitFlag,
+    int64_t unitGroup) {
+  mma_tile_core<half, float, float, true, false, false, true>(
+      a, b, init, m, k, n, c, waitA, waitB, releaseA, releaseB, kloopDb,
+      backEvent0, backEvent1, unitFlag, unitGroup);
 }

@@ -16,10 +16,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
+#include "bishengir/Dialect/HIVM/Analysis/CVPAttentionPlan.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
 #include "bishengir/Dialect/HIVM/Transforms/TileAndBindSubBlock/TileUtils.h"
+#include "bishengir/Dialect/HIVM/Transforms/regbase/CVPQuerySchedule.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 #include "bishengir/Dialect/HIVM/Utils/WorkItem.h"
 #include "bishengir/Dialect/HIVM/Utils/WorklistBuilder.h"
@@ -35,9 +37,14 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/CheckedArithmetic.h"
+#include <limits>
 
 #define DEBUG_TYPE "cv-pipelining"
 
@@ -70,9 +77,13 @@ struct AtomicEffect {
 
 struct CVPipelineImpl {
   CVPipelineImpl(LoopLikeOpInterface loop, int multibuffer,
-                 CVPipelineMode pipelineMode, bool enableLazyLoading)
+                 CVPipelineMode pipelineMode, bool enableLazyLoading,
+                 bool recordAttentionPlan, bool continuousQuery = false,
+                 unsigned queryKeyUnroll = 1)
       : pipelineLoop(loop), newLoop(nullptr), builder(loop->getContext()),
         numMultibuffer(multibuffer), pipelineMode(pipelineMode),
+        recordAttentionPlan(recordAttentionPlan),
+        continuousQuery(continuousQuery), queryKeyUnroll(queryKeyUnroll),
         wlBuilder(cast<scf::ForOp>(loop.getOperation()), multibuffer,
                   enableLazyLoading),
         yieldedVals(loop.getYieldedValues().begin(),
@@ -84,6 +95,11 @@ struct CVPipelineImpl {
   LogicalResult run();
 
 private:
+  /// Preserve the original persistent query/key domain before the ordinary
+  /// emitter replaces the key loop. This is provenance for a later query
+  /// transform, not a certificate that query state is already streamed.
+  LogicalResult captureQueryUnrollDomain();
+
   void collectAtomicEffects();
 
   LogicalResult markOutputs();
@@ -190,6 +206,11 @@ private:
 
   // Pipeline mode for CV-pipelining.
   CVPipelineMode pipelineMode;
+  bool recordAttentionPlan;
+  bool continuousQuery;
+  unsigned queryKeyUnroll;
+  DictionaryAttr originalAttentionPlan;
+  std::optional<CVPQuerySchedule> queryUnrollSchedule;
 
   // Worklist builder — owns dep-tracking machinery, separator/dependence
   // discovery, lazy-load hint surface, and outputMemrefMap. Held as a member
@@ -1436,6 +1457,28 @@ LogicalResult CVPipelineImpl::createNewLoops() {
   newLoop =
       builder.create<scf::ForOp>(loc, lb, ub, newStep, pipelineLoop.getInits());
   newLoop->setAttr(hivm::kCVUnrolledLoopName, builder.getUnitAttr());
+  if (queryUnrollSchedule) {
+    const auto &schedule = *queryUnrollSchedule;
+    newLoop->setAttr(
+        "hivm.cvp_query.unroll_domain",
+        builder.getDictionaryAttr(
+            {builder.getNamedAttr("key_count", builder.getI64IntegerAttr(
+                                                   schedule.getKeyCount())),
+             builder.getNamedAttr(
+                 "key_step", builder.getI64IntegerAttr(schedule.getKeyStep())),
+             builder.getNamedAttr("query_upper", builder.getI64IntegerAttr(
+                                                     schedule.getQueryUpper())),
+             builder.getNamedAttr("query_step", builder.getI64IntegerAttr(
+                                                    schedule.getQueryStep())),
+             builder.getNamedAttr("emitted_lanes",
+                                  builder.getI32IntegerAttr(numMultibuffer)),
+             builder.getNamedAttr("workspace_depth",
+                                  builder.getI32IntegerAttr(numMultibuffer)),
+             builder.getNamedAttr("continuous", builder.getBoolAttr(false))}));
+    // The parent query loop still owns the original SSA lower bound. Neither
+    // an SSA spelling nor a physical core-count constant is stored as identity.
+    newLoop->setAttr(kCVPAttentionPlanAttr, originalAttentionPlan);
+  }
   if (newLoop->getNumResults() == 0)
     newLoop.getBody()->getTerminator()->erase();
 
@@ -1463,8 +1506,11 @@ LogicalResult CVPipelineImpl::createNewLoops() {
   Value cappedUB = builder.create<affine::AffineApplyOp>(
       loc, cappedUBExpr, ValueRange({ub, iv, originStep}));
   Value actualUB = builder.create<arith::MinUIOp>(loc, cappedUB, pipelineIters);
+  if (queryUnrollSchedule)
+    actualUB.getDefiningOp()->setAttr("hivm.cvp_query.unroll_coordinate",
+                                      builder.getStringAttr("valid_lanes"));
 
-  for (auto &item : worklist) {
+  for (auto [stageIndex, item] : llvm::enumerate(worklist)) {
     // Reset insertion point after we're done with this item
     OpBuilder::InsertionGuard g(builder);
     if (failed(expandOutputInits(item.get())))
@@ -1489,6 +1535,9 @@ LogicalResult CVPipelineImpl::createNewLoops() {
                         TCoreTypeAttr::get(ctx, item->core)),
          NamedAttribute(builder.getStringAttr(kMultibufferUnrollAttrName),
                         builder.getI32IntegerAttr(numMultibuffer))});
+    if (queryUnrollSchedule)
+      item->forOp->setAttr("hivm.cvp_query.unroll_stage",
+                           builder.getI32IntegerAttr(stageIndex));
     builder.setInsertionPointToStart(item->forOp.getBody());
     Value workItemIV = item->forOp.getInductionVar();
     item->reconstructedIV = builder.create<affine::AffineApplyOp>(
@@ -1509,6 +1558,29 @@ LogicalResult CVPipelineImpl::createNewLoops() {
       item->irMap.map(origIV, ivCast);
     } else
       item->irMap.map(origIV, item->reconstructedIV);
+
+    if (queryUnrollSchedule) {
+      // These operands are the ones used by migrateOps. Per-query first/last
+      // predicates follow the reconstructed logical key, including short U4
+      // tails; lane zero and lane U-1 alone are not boundary predicates.
+      Value logicalKey = item->irMap.lookup(origIV);
+      logicalKey.getDefiningOp()->setAttr("hivm.cvp_query.unroll_coordinate",
+                                          builder.getStringAttr("logical_key"));
+      auto constant = [&](int64_t value) -> Value {
+        return builder.create<arith::ConstantOp>(
+            loc, logicalKey.getType(),
+            builder.getIntegerAttr(logicalKey.getType(), value));
+      };
+      Value first = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                                  logicalKey, constant(0));
+      Value last = builder.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, logicalKey,
+          constant(queryUnrollSchedule->getLastKey()));
+      first.getDefiningOp()->setAttr("hivm.cvp_query.unroll_coordinate",
+                                     builder.getStringAttr("first_key"));
+      last.getDefiningOp()->setAttr("hivm.cvp_query.unroll_coordinate",
+                                    builder.getStringAttr("last_key"));
+    }
 
     // Remap the yield results within the work item
     unsigned yieldArg = 0;
@@ -2544,8 +2616,65 @@ LogicalResult CVPipelineImpl::duplicateExtractScalarForCube() {
   return success();
 }
 
+LogicalResult CVPipelineImpl::captureQueryUnrollDomain() {
+  if (!recordAttentionPlan || pipelineMode != CVPipelineMode::Unroll)
+    return success();
+  originalAttentionPlan =
+      pipelineLoop->getAttrOfType<DictionaryAttr>(kCVPAttentionPlanAttr);
+  if (!originalAttentionPlan)
+    return pipelineLoop->hasAttr(kCVPAttentionPlanAttr) ? failure() : success();
+  auto key = dyn_cast<scf::ForOp>(pipelineLoop.getOperation());
+  auto query = key ? dyn_cast<scf::ForOp>(key->getParentOp()) : scf::ForOp();
+  if (!query || !query.getInitArgs().empty() ||
+      !key.getInductionVar().getType().isInteger(32) ||
+      !query.getInductionVar().getType().isInteger(32) ||
+      key->hasAttr("unsignedCmp") || query->hasAttr("unsignedCmp"))
+    return failure();
+  // Re-analyze the actual original operations; a dictionary alone is not proof
+  // of recurrence roles. The generated loops retain these original role attrs.
+  std::string reason;
+  auto attention = analyzeCVPAttention(key, reason);
+  if (failed(attention) ||
+      attention->getSummary(builder.getContext()) != originalAttentionPlan)
+    return failure();
+  DenseSet<Operation *> roleOperations;
+  for (auto [operation, role] : attention->roles) {
+    auto recorded = operation->getAttrOfType<StringAttr>(kCVPAttentionRoleAttr);
+    if (!recorded || recorded.getValue() != stringifyCVPAttentionRole(role))
+      return failure();
+    roleOperations.insert(operation);
+  }
+  bool unexpectedRole = false;
+  key.walk([&](Operation *operation) {
+    unexpectedRole |= operation->hasAttr(kCVPAttentionRoleAttr) &&
+                      !roleOperations.contains(operation);
+  });
+  if (unexpectedRole)
+    return failure();
+  auto lower = getConstantIntValue(key.getLowerBound());
+  auto upper = getConstantIntValue(key.getUpperBound());
+  auto step = getConstantIntValue(key.getStep());
+  auto queryUpper = getConstantIntValue(query.getUpperBound());
+  auto queryStep = getConstantIntValue(query.getStep());
+  if (!lower || *lower != 0 || !upper || !step || !queryUpper || !queryStep ||
+      *upper != attention->keyCount || *step != attention->blockN)
+    return failure();
+  queryUnrollSchedule =
+      CVPQuerySchedule::create(*upper, *step, *queryUpper, *queryStep, reason);
+  if (!queryUnrollSchedule) {
+    pipelineLoop->emitRemark("ordinary Unroll query provenance rejected: ")
+        << reason;
+    return failure();
+  }
+  return success();
+}
+
 /// Main method of the pass
 LogicalResult CVPipelineImpl::run() {
+  if (failed(captureQueryUnrollDomain())) {
+    revert();
+    return failure();
+  }
   if (failed(duplicateExtractScalarForCube()))
     return failure();
   collectAtomicEffects();
@@ -2564,12 +2693,28 @@ LogicalResult CVPipelineImpl::run() {
   outputMemrefMap = buildResult->outputMemrefMap;
   numMultibuffer = buildResult->resolvedMultibuffer;
   workspaceAllocs = buildResult->workspaceAllocs;
+  if (queryUnrollSchedule && !continuousQuery) {
+    auto emittedStep = llvm::checkedMul(queryUnrollSchedule->getKeyStep(),
+                                        int64_t{numMultibuffer});
+    if (!queryUnrollSchedule->getValidKeyLanes(0, numMultibuffer) ||
+        !emittedStep || *emittedStep > std::numeric_limits<int32_t>::max()) {
+      pipelineLoop->emitRemark("ordinary Unroll query provenance requires a "
+                               "representable U1/U2/U4 body");
+      revert();
+      return failure();
+    }
+  }
+  if (continuousQuery && queryUnrollSchedule &&
+      !queryUnrollSchedule->canEmitQueryUnroll(queryKeyUnroll)) {
+    revert();
+    return failure();
+  }
 
   if (failed(absorbMergerOpsIntoWorkItems())) {
     revert();
     return failure();
   }
-  if (pipelineMode == CVPipelineMode::Skew &&
+  if ((pipelineMode == CVPipelineMode::Skew || continuousQuery) &&
       failed(collectWorkspaceAllocsForPreload()))
     return failure();
   if (failed(markOutputs())) {
@@ -2608,13 +2753,30 @@ LogicalResult CVPipelineImpl::run() {
   }
 
   // Preload pipeline reuse workitems with cvpipeline.
-  if (pipelineMode == CVPipelineMode::Skew) {
+  if (pipelineMode == CVPipelineMode::Skew || continuousQuery) {
+    Attribute attentionPlan = recordAttentionPlan
+                                  ? pipelineLoop->getAttr(kCVPAttentionPlanAttr)
+                                  : Attribute();
     if (failed(privatizeSharedCounterIterArgs())) {
       revert();
       return failure();
     }
     expandWorkspace(builder);
-    return markScopesForPreload();
+    LogicalResult result = markScopesForPreload();
+    if (succeeded(result) && attentionPlan) {
+      pipelineLoop->setAttr(kCVPAttentionPlanAttr, attentionPlan);
+      pipelineLoop->setAttr(
+          kCVPAttentionAppliedAttr,
+          builder.getStringAttr(continuousQuery ? "unroll-staged" : "skew"));
+      if (continuousQuery) {
+        pipelineLoop->setAttr("hivm.cvp_query.unroll_factor",
+                              builder.getI32IntegerAttr(queryKeyUnroll));
+        for (auto scope : pipelineLoop.getBody()->getOps<scope::ScopeOp>())
+          scope->setAttr("hivm.cvp_query.unroll_factor",
+                         builder.getI32IntegerAttr(queryKeyUnroll));
+      }
+    }
+    return result;
   }
 
   // The unroll pipeline also uses the expanded workspace slots.
@@ -2642,6 +2804,9 @@ LogicalResult CVPipelineImpl::run() {
     return failure();
   }
 
+  if (queryUnrollSchedule)
+    newLoop->setAttr(kCVPAttentionAppliedAttr, builder.getStringAttr("unroll"));
+
   SmallVector<annotation::MarkOp> markOps;
   newLoop.walk([&](annotation::MarkOp markOp) {
     markOps.push_back(markOp);
@@ -2658,10 +2823,39 @@ LogicalResult CVPipelineImpl::run() {
 }
 
 void CVPipeliningPass::runOnOperation() {
-  func::FuncOp func = getOperation();
+  func::FuncOp originalFunction = getOperation();
+  func::FuncOp func = originalFunction;
   SmallVector<scf::ForOp> pipelineCandidates;
+  if (continuousQuery &&
+      (pipelineMode != CVPipelineMode::Unroll || !annotateAttention ||
+       (queryKeyUnroll != 1 && queryKeyUnroll != 2 && queryKeyUnroll != 4) ||
+       setDepthInUnrollMode == 0 || setDepthInUnrollMode == 1)) {
+    func.emitError("continuous Unroll requires annotated attention, U1/U2/U4 "
+                   "and at least two workspace buffers");
+    return signalPassFailure();
+  }
+  OwningOpRef<ModuleOp> transaction;
+  if (continuousQuery) {
+    bool recognized = false;
+    func.walk([&](scf::ForOp loop) {
+      recognized |= loop->hasAttr(kCVPAttentionPlanAttr);
+    });
+    if (!recognized)
+      return;
+    auto parent = func->getParentOfType<ModuleOp>();
+    if (!parent) {
+      func.emitError("continuous Unroll requires module symbol/target context");
+      return signalPassFailure();
+    }
+    transaction = OwningOpRef<ModuleOp>(cast<ModuleOp>(parent->clone()));
+    func = transaction->lookupSymbol<func::FuncOp>(func.getSymName());
+  }
 
-  if (this->setDepthInUnrollMode == 1 || this->setDepthInUnrollMode == 0)
+  const bool annotatedUnitUnroll = this->setDepthInUnrollMode == 1 &&
+                                   this->annotateAttention &&
+                                   this->pipelineMode == CVPipelineMode::Unroll;
+  if (this->setDepthInUnrollMode == 0 ||
+      (this->setDepthInUnrollMode == 1 && !annotatedUnitUnroll))
     return;
 
   // Disable CVP once batchmatmul is found
@@ -2676,16 +2870,35 @@ void CVPipeliningPass::runOnOperation() {
 
   DenseSet<scf::ForOp> pipelinedNest;
   for (auto loop : pipelineCandidates) {
+    if (continuousQuery && !loop->hasAttr(kCVPAttentionPlanAttr))
+      continue;
+    // Preserve the default depth-one no-op for every unrelated loop. Explicit
+    // annotated attention uses the same real emitter at U1 as U2/U4.
+    if (annotatedUnitUnroll && !loop->hasAttr(kCVPAttentionPlanAttr))
+      continue;
     // Don't attempt pipeline if nested loop succeeded already
     if (pipelinedNest.contains(loop))
       continue;
 
     auto parentLoop = loop->getParentOfType<scf::ForOp>();
+    const bool requestedQueryUnroll =
+        this->annotateAttention &&
+        this->pipelineMode == CVPipelineMode::Unroll &&
+        loop->hasAttr(kCVPAttentionPlanAttr);
     CVPipelineImpl impl(loop, this->setDepthInUnrollMode, this->pipelineMode,
-                        this->enableLazyLoading);
+                        this->enableLazyLoading, this->annotateAttention,
+                        this->continuousQuery, this->queryKeyUnroll);
 
-    // Mark all parent loops to not attempt pipelining to save compile time
-    if (impl.run().succeeded())
+    // An unsupported annotated query candidate must not fall through to a
+    // different pipeline of its enclosing query/task loop after rollback.
+    // Successful candidates retain the existing ancestor exclusion.
+    bool applied = succeeded(impl.run());
+    if (continuousQuery && requestedQueryUnroll && !applied) {
+      func.emitError(
+          "continuous Unroll candidate rejected; original function retained");
+      return signalPassFailure();
+    }
+    if (applied || requestedQueryUnroll)
       while (parentLoop) {
         pipelinedNest.insert(parentLoop);
         parentLoop = parentLoop->getParentOfType<scf::ForOp>();
@@ -2693,6 +2906,12 @@ void CVPipeliningPass::runOnOperation() {
   }
 
   removeWorkspaceMultiBufferMarks(func);
+  if (continuousQuery) {
+    if (failed(verify(func)))
+      return signalPassFailure();
+    originalFunction.getBody().takeBody(func.getBody());
+    originalFunction->setAttrs(func->getAttrs());
+  }
 }
 
 std::unique_ptr<Pass>

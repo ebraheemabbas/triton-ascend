@@ -15,13 +15,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "bishengir/Dialect/HACC/Utils/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMDialectExtension.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
 #include "bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
-#include "bishengir/Dialect/HACC/Utils/Utils.h"
 #include "bishengir/Dialect/Utils/Util.h"
 
 #include "mlir/IR/Builders.h"
@@ -86,7 +86,8 @@ template <typename OpTy> std::string getCumOpLibraryCallName(OpTy op) {
       ss << baseName.data() << "_" << rank << "d_"
          << getTypeName(op.getLoc(), elemType);
       // i32 src → i64 dst 1D dim0 has a fused SIMT symbol that folds the sext
-      // into the per-thread read; other mixed shapes fall back to same-type name.
+      // into the per-thread read; other mixed shapes fall back to same-type
+      // name.
       if (elemType.isInteger(32) && dstElemType.isInteger(64) && rank == 1 &&
           cumDim == 0) {
         ss << "_to_" << getTypeName(op.getLoc(), dstElemType);
@@ -353,15 +354,15 @@ std::string getVGatherOpLibraryCallName(VGatherOp concreteOp,
                                                static_cast<int>(rank));
     ShapedType idxVecType = cast<ShapedType>(concreteOp.getIndices().getType());
     Type idxElemType = idxVecType.getElementType();
-    std::string idxElemTypeName =
-        getTypeName(concreteOp.getLoc(), idxElemType);
+    std::string idxElemTypeName = getTypeName(concreteOp.getLoc(), idxElemType);
     // SIMT path: all gather operations use the SIMT template.
     // Generates: gather_simt_<dim>d_<dtype>_<itype>
     return concatVectorOpLibraryCallName(baseName.str() + "_simt", libCallRank,
                                          elemTypeName + "_" + idxElemTypeName);
   } else {
     std::stringstream ss;
-    ss << baseName.data() << "_1d_" << getTypeName(concreteOp.getLoc(), elemType);
+    ss << baseName.data() << "_1d_"
+       << getTypeName(concreteOp.getLoc(), elemType);
     return ss.str();
   }
 }
@@ -606,8 +607,8 @@ struct StaticMaxRankExternalModel
     // Op-specific impl.
     if (isRegBased) {
       if constexpr (std::is_same_v<ConcreteOp, VCummaxOp> ||
-                  std::is_same_v<ConcreteOp, VCumminOp>) {
-      return getCumOpLibraryCallName(concreteOp);
+                    std::is_same_v<ConcreteOp, VCumminOp>) {
+        return getCumOpLibraryCallName(concreteOp);
       }
     }
     if constexpr (std::is_same_v<ConcreteOp, VCumsumOp> ||
@@ -783,10 +784,9 @@ struct StaticMaxRankExternalModel
             hivm::TypeFn casting = hivm::TypeFn::cast_signed;
             if constexpr (std::is_same_v<ConcreteOp, VDivOp>) {
               casting = concreteOp.getIsSigned() ? hivm::TypeFn::cast_signed
-                                                  : hivm::TypeFn::cast_unsigned;
+                                                 : hivm::TypeFn::cast_unsigned;
             }
-            elemTypeName = getTypeName(concreteOp.getLoc(), elemType,
-                                       casting);
+            elemTypeName = getTypeName(concreteOp.getLoc(), elemType, casting);
           }
           int rank = static_cast<int>(concreteOp.getNumLoops());
           return concatVectorOpLibraryCallName(baseCallName + suffix,
@@ -896,8 +896,7 @@ int InferMaxRankExternalModel<VBrcOp>::inferOpLibraryMaxRank(
   VBrcOp op = cast<VBrcOp>(operation);
   MemRefType dstVecType = cast<MemRefType>(op.getDst().getType());
   auto dstMemSpaceAttr = dstVecType.getMemorySpace();
-  auto dstAddrSpace =
-      cast<AddressSpaceAttr>(dstMemSpaceAttr).getAddressSpace();
+  auto dstAddrSpace = cast<AddressSpaceAttr>(dstMemSpaceAttr).getAddressSpace();
   if (dstAddrSpace == AddressSpace::L1)
     return 1;
 
@@ -1145,6 +1144,24 @@ std::string NoMaxRankExternalModel<MmadL1Op>::getOpLibraryCallName(
     Operation *op, std::optional<bool> isOpsAligned) const {
   auto concreteOp = cast<MmadL1Op>(op);
   auto baseCallName = concreteOp.getOpName().str();
+  if (auto cache = concreteOp.getCvpQCacheAttr()) {
+    auto role = cache.getAs<StringAttr>("role");
+    auto mode = cache.getAs<StringAttr>("mode");
+    assert(role && mode && "cache contract must be verified before lowering");
+    bool bankedReady = concreteOp->hasAttr("hivm.cvp_cube.banked_ready");
+    if (bankedReady && role.getValue() == "pv")
+      baseCallName = "mma_tile_cvp_qcache_pv_bank_ready_v1";
+    else if (bankedReady && mode.getValue() == "neutral")
+      baseCallName = "mma_tile_cvp_qcache_qk_neutral_bank_ready_v1";
+    else if (bankedReady)
+      baseCallName = "mma_tile_cvp_qcache_qk_cached_bank_ready_v1";
+    else if (role.getValue() == "pv")
+      baseCallName = "mma_tile_cvp_qcache_pv_v1";
+    else if (mode.getValue() == "neutral")
+      baseCallName = "mma_tile_cvp_qcache_qk_neutral_v1";
+    else
+      baseCallName = "mma_tile_cvp_qcache_qk_cached_v1";
+  }
   auto srcTypeName =
       getTypeName(concreteOp.getLoc(),
                   getElementTypeOrSelf(concreteOp.getDpsInputs()[0].getType()));
@@ -1195,9 +1212,9 @@ std::string NoMaxRankExternalModel<MmadMxL1Op>::getOpLibraryCallName(
   auto elemBType = getElementTypeOrSelf(concreteOp.getDpsInputs()[1].getType());
 
   auto srcTypeName = getTypeName(concreteOp.getLoc(), elemAType);
-  auto dstTypeName = getTypeName(
-      concreteOp.getLoc(),
-      getElementTypeOrSelf(concreteOp.getDpsInits()[0].getType()));
+  auto dstTypeName =
+      getTypeName(concreteOp.getLoc(),
+                  getElementTypeOrSelf(concreteOp.getDpsInits()[0].getType()));
 
   std::string finalName = baseCallName;
   if (concreteOp.getPerChannelBias()) {
@@ -1505,8 +1522,7 @@ static std::string getGatherLoadLibraryCallName(CustomOpT op) {
   const std::string idxTypeStr =
       getTypeName(op->getLoc(), getElementTypeOrSelf(idxType));
 
-  return "gather_out_to_ub_" + libCallDim + "_" + srcTypeStr + "_" +
-         idxTypeStr;
+  return "gather_out_to_ub_" + libCallDim + "_" + srcTypeStr + "_" + idxTypeStr;
 }
 
 template <typename CustomOpT>

@@ -1,0 +1,125 @@
+[
+  {
+    "case": "n32768-hd64",
+    "file": "n32768-hd64.before-boundary.mlir",
+    "sha256": "6402ed3d6d9b7085ef1acbf4db8eb542d30e6205ffd1da0787ea97b8ed703671",
+    "bytes": 43967,
+    "source_member": "run/n32768-hd64/dense_max_state_boundaries/pass-062-before.mlir",
+    "matching_attempts": 6,
+    "chosen_attempt": "first",
+    "profile": "dense_max_state",
+    "source_arm": "dense_max_state_boundaries"
+  },
+  {
+    "case": "n16384-hd128",
+    "file": "n16384-hd128.before-boundary.mlir",
+    "sha256": "39ac99aea2a19ad95d1a921413a77be65b938d775aa1ac14541a8c7d67ad1a19",
+    "bytes": 44080,
+    "source_member": "run/n16384-hd128/dense_max_state_boundaries/pass-060-before.mlir",
+    "matching_attempts": 6,
+    "chosen_attempt": "first",
+    "profile": "dense_max_state",
+    "source_arm": "dense_max_state_boundaries"
+  },
+  {
+    "case": "n1024-hd128",
+    "file": "n1024-hd128.before-boundary.mlir",
+    "sha256": "1d6f1641b09ac664b3c6f041ad0aa22e076cce9371536ce7370eb1e8c1a51605",
+    "bytes": 44035,
+    "source_member": "run/n1024-hd128/dense_max_state_boundaries/pass-060-before.mlir",
+    "matching_attempts": 6,
+    "chosen_attempt": "first",
+    "profile": "dense_max_state",
+    "source_arm": "dense_max_state_boundaries"
+  },
+  {
+    "case": "n32768-hd64",
+    "profile": "key_major_score",
+    "source_arm": "key_major_score",
+    "file": "n32768-hd64--key_major_score.before-memory.mlir",
+    "sha256": "e94f74190ba6128c12aa5da98dcb70a3e4518e46badd824510fa8316c4ec2bb4",
+    "bytes": 45302,
+    "source_member": "run/n32768-hd64/key_major_score/pass-078-before.mlir",
+    "chosen_attempt": "last before final local memory planning"
+  },
+  {
+    "case": "n32768-hd64",
+    "profile": "p_state",
+    "source_arm": "p_state",
+    "file": "n32768-hd64--p_state.before-memory.mlir",
+    "sha256": "5e04676e2db8efa1fed229dbf31cdf05a6698e2b63d22a4236342d78e9ebd635",
+    "bytes": 43096,
+    "source_member": "run/n32768-hd64/p_state/pass-070-before.mlir",
+    "chosen_attempt": "last before final local memory planning"
+  },
+  {
+    "case": "n32768-hd64",
+    "profile": "four_chain_max_state",
+    "source_arm": "four_chain_max_state",
+    "file": "n32768-hd64--four_chain_max_state.before-memory.mlir",
+    "sha256": "91737270d301aaf56f9175c6c30f6fee58d0107efdfaa6b4db75575304c4d0de",
+    "bytes": 46900,
+    "source_member": "run/n32768-hd64/four_chain_max_state/pass-062-before.mlir",
+    "chosen_attempt": "last before final local memory planning"
+  },
+  {
+    "case": "n16384-hd128",
+    "profile": "key_major_score",
+    "source_arm": "key_major_score",
+    "file": "n16384-hd128--key_major_score.before-memory.mlir",
+    "sha256": "b689ee2ca6bb26055925fc0b6c2dca61e688fceacace8586b0812b113f9c2109",
+    "bytes": 45540,
+    "source_member": "run/n16384-hd128/key_major_score/pass-076-before.mlir",
+    "chosen_attempt": "last before final local memory planning"
+  },
+  {
+    "case": "n16384-hd128",
+    "profile": "p_state",
+    "source_arm": "p_state",
+    "file": "n16384-hd128--p_state.before-memory.mlir",
+    "sha256": "589d6b1fb2ccba7a1f390fa5025bfc10c3784ad4e044237cc7fd80653b58f257",
+    "bytes": 43226,
+    "source_member": "run/n16384-hd128/p_state/pass-068-before.mlir",
+    "chosen_attempt": "last before final local memory planning"
+  },
+  {
+    "case": "n16384-hd128",
+    "profile": "four_chain_max_state",
+    "source_arm": "four_chain_max_state",
+    "file": "n16384-hd128--four_chain_max_state.before-memory.mlir",
+    "sha256": "06dce07fc06ef353b3bcb1878aa0a9cc5ee7647d2a31fc7f1876edbcb11eb848",
+    "bytes": 47030,
+    "source_member": "run/n16384-hd128/four_chain_max_state/pass-060-before.mlir",
+    "chosen_attempt": "last before final local memory planning"
+  },
+  {
+    "case": "n1024-hd128",
+    "profile": "key_major_score",
+    "source_arm": "key_major_score",
+    "file": "n1024-hd128--key_major_score.before-memory.mlir",
+    "sha256": "c99b4cebea3ad094fea0a9f1aff5b28bbc83f7c43fc3c4e3fd5cc02dcfccfb09",
+    "bytes": 45495,
+    "source_member": "run/n1024-hd128/key_major_score/pass-076-before.mlir",
+    "chosen_attempt": "last before final local memory planning"
+  },
+  {
+    "case": "n1024-hd128",
+    "profile": "p_state",
+    "source_arm": "p_state",
+    "file": "n1024-hd128--p_state.before-memory.mlir",
+    "sha256": "17b400805844470e27a443a9b559bb93f588f374703b96385be170af4b2854c9",
+    "bytes": 43181,
+    "source_member": "run/n1024-hd128/p_state/pass-068-before.mlir",
+    "chosen_attempt": "last before final local memory planning"
+  },
+  {
+    "case": "n1024-hd128",
+    "profile": "four_chain_max_state",
+    "source_arm": "four_chain_max_state",
+    "file": "n1024-hd128--four_chain_max_state.before-memory.mlir",
+    "sha256": "29b1fd15e30450d8acb5a0659bcb73b8765ecd02819d2108b1bd5a4b27318200",
+    "bytes": 46985,
+    "source_member": "run/n1024-hd128/four_chain_max_state/pass-060-before.mlir",
+    "chosen_attempt": "last before final local memory planning"
+  }
+]

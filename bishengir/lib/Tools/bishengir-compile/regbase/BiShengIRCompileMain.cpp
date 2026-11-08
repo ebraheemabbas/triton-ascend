@@ -1,4 +1,5 @@
-//===- BiShengIRCompileMain.cpp - RegBase compile orchestration ------------===//
+//===- BiShengIRCompileMain.cpp - RegBase compile orchestration
+//------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -11,13 +12,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "bishengir/Dialect/HACC/Utils/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Pass/PassManager.h"
 #include "bishengir/Tools/Utils/Utils.h"
 #include "bishengir/Tools/bishengir-compile/BiShengIRCompile.h"
 #include "bishengir/Tools/bishengir-compile/regbase/PassPipeline.h"
 #include "bishengir/Tools/bishengir-compile/regbase/Utility.h"
-#include "bishengir/Dialect/HACC/Utils/Utils.h"
 #include "mlir/Support/FileUtilities.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LogicalResult.h"
@@ -89,7 +90,8 @@ static void addBitcodeAttrsToModule(ModuleOp module, StringRef executablePath,
     if (llvm::sys::fs::real_path(bcPath, canonicalPath))
       return;
     module->setAttr(
-        attrName, createAttr(ctx, mlir::StringAttr::get(ctx, canonicalPath.str().str())));
+        attrName,
+        createAttr(ctx, mlir::StringAttr::get(ctx, canonicalPath.str().str())));
   };
 
   if (mlir::hacc::utils::isAscend950(config.getTarget())) {
@@ -101,11 +103,13 @@ static void addBitcodeAttrsToModule(ModuleOp module, StringRef executablePath,
                 [](MLIRContext *c, mlir::StringAttr s) -> mlir::Attribute {
                   return mlir::hivm::AIV_BITCODEAttr::get(c, s);
                 });
-    addIfExists("meta_op.mix.aic.c310.bc", mlir::hivm::MIX_AIC_BITCODEAttr::name,
+    addIfExists("meta_op.mix.aic.c310.bc",
+                mlir::hivm::MIX_AIC_BITCODEAttr::name,
                 [](MLIRContext *c, mlir::StringAttr s) -> mlir::Attribute {
                   return mlir::hivm::MIX_AIC_BITCODEAttr::get(c, s);
                 });
-    addIfExists("meta_op.mix.aiv.c310.bc", mlir::hivm::MIX_AIV_BITCODEAttr::name,
+    addIfExists("meta_op.mix.aiv.c310.bc",
+                mlir::hivm::MIX_AIV_BITCODEAttr::name,
                 [](MLIRContext *c, mlir::StringAttr s) -> mlir::Attribute {
                   return mlir::hivm::MIX_AIV_BITCODEAttr::get(c, s);
                 });
@@ -118,11 +122,13 @@ static void addBitcodeAttrsToModule(ModuleOp module, StringRef executablePath,
                 [](MLIRContext *c, mlir::StringAttr s) -> mlir::Attribute {
                   return mlir::hivm::AIV_BITCODEAttr::get(c, s);
                 });
-    addIfExists("meta_op.mix.aic.c220.bc", mlir::hivm::MIX_AIC_BITCODEAttr::name,
+    addIfExists("meta_op.mix.aic.c220.bc",
+                mlir::hivm::MIX_AIC_BITCODEAttr::name,
                 [](MLIRContext *c, mlir::StringAttr s) -> mlir::Attribute {
                   return mlir::hivm::MIX_AIC_BITCODEAttr::get(c, s);
                 });
-    addIfExists("meta_op.mix.aiv.c220.bc", mlir::hivm::MIX_AIV_BITCODEAttr::name,
+    addIfExists("meta_op.mix.aiv.c220.bc",
+                mlir::hivm::MIX_AIV_BITCODEAttr::name,
                 [](MLIRContext *c, mlir::StringAttr s) -> mlir::Attribute {
                   return mlir::hivm::MIX_AIV_BITCODEAttr::get(c, s);
                 });
@@ -173,29 +179,32 @@ runExternalHIVMC(ModuleOp &module,
     }
     if (!llvm::sys::fs::exists(saveTempsDir))
       if (auto ec = llvm::sys::fs::create_directories(saveTempsDir)) {
-        llvm::errs() << "[ERROR] Failed to create save-temps directory: " << saveTempsDir << "\n";
+        llvm::errs() << "[ERROR] Failed to create save-temps directory: "
+                     << saveTempsDir << "\n";
         return failure();
       }
     llvm::sys::path::append(saveTempsDir, inputFile);
     std::string errorMessage;
     inputFileHandler = mlir::openOutputFile(saveTempsDir, &errorMessage);
     if (!inputFileHandler) {
-      llvm::errs() << "[ERROR] Failed to open save-temps file: " << errorMessage << "\n";
+      llvm::errs() << "[ERROR] Failed to open save-temps file: " << errorMessage
+                   << "\n";
       return failure();
     }
     inputFileHandler->keep();
   } else {
     inputFileHandler = getTempFile(inputFile, tempDirsStore);
     if (!inputFileHandler) {
-      llvm::dbgs() << "[ERROR] Failed to create temporary input file needed to run hivmc compile.\n";
+      llvm::dbgs() << "[ERROR] Failed to create temporary input file needed to "
+                      "run hivmc compile.\n";
       return failure();
     }
   }
   inputFile = inputFileHandler->outputFilename();
 
-  module.print(inputFileHandler->os(), mlir::OpPrintingFlags().enableDebugInfo(
-                                         config.getEnableSanitizer() ||
-                                         config.getEnableDebugInfo()));
+  module.print(inputFileHandler->os(),
+               mlir::OpPrintingFlags().enableDebugInfo(
+                   config.getEnableSanitizer() || config.getEnableDebugInfo()));
   inputFileHandler->os().flush();
 
   std::vector<std::string> arguments;
@@ -204,7 +213,8 @@ runExternalHIVMC(ModuleOp &module,
 
   auto hivmcOptions = config.getHIVMCArgsDashDash();
   llvm::append_range(arguments, hivmcOptions);
-  for (const auto &arg : regbase::filterSharedHIVMCOptions(config.getClArgs())) {
+  for (const auto &arg :
+       regbase::filterSharedHIVMCOptions(config.getClArgs())) {
     auto argName = StringRef(arg).ltrim('-').split('=').first;
     if (!regbase::hasCLIArg(arguments, argName))
       arguments.push_back(arg);
@@ -215,26 +225,22 @@ runExternalHIVMC(ModuleOp &module,
   arguments.push_back("--only-run-hivm-pipeline=false");
 
   // TODO: Support options in hivmc
-  std::set<std::string> blacklist = {"inject-ir-from-file", "print-pass-id",
-                                     "inject-ir-before", "inject-ir-after",
-                                     "hfusion-enable-multiple-consumer-fusion",
-                                     "disable-tightly-coupled-buffer-reuse",
-                                     "enable-hivm-cross-core-gss",
-                                     "enable-tree-reduce-v2",
-                                     "vf-fusion-mode",
-                                     "disable-vf-reachable-check",
-                                     "enable-sink-dpx-load",
-                                     // hivmc-a5 does not recognize
-                                     // --enable-lir-compile (it is an A3
-                                     // bishengir-compile-only flag). Drop it
-                                     // before forwarding to hivmc-a5 in the
-                                     // RegBase path.
-                                     "enable-lir-compile"};
+  std::set<std::string> blacklist = {
+      "inject-ir-from-file", "print-pass-id", "inject-ir-before",
+      "inject-ir-after", "hfusion-enable-multiple-consumer-fusion",
+      "disable-tightly-coupled-buffer-reuse", "enable-hivm-cross-core-gss",
+      "enable-tree-reduce-v2", "vf-fusion-mode", "disable-vf-reachable-check",
+      "enable-sink-dpx-load",
+      // hivmc-a5 does not recognize
+      // --enable-lir-compile (it is an A3
+      // bishengir-compile-only flag). Drop it
+      // before forwarding to hivmc-a5 in the
+      // RegBase path.
+      "enable-lir-compile"};
   auto skippedArgs = skipOptions(arguments, blacklist);
 
   SmallVector<StringRef> argumentsRef(skippedArgs.begin(), skippedArgs.end());
-  if (failed(execute(getHIVMCName(), getBiShengInstallPath(),
-                     argumentsRef))) {
+  if (failed(execute(getHIVMCName(), getBiShengInstallPath(), argumentsRef))) {
     return failure();
   }
 
@@ -243,15 +249,16 @@ runExternalHIVMC(ModuleOp &module,
 
 using MixedModules = std::pair<ModuleOp, SmallVector<ModuleOp, 2>>;
 
-/// Run a pipeline on a module using the regbase builder and A3's runPipeline utility.
-static LogicalResult
-runPipelineRegBase(ModuleOp mod,
-                   const PipelineBuilder &buildPipeline,
-                   BiShengIRCompileMainConfig &config,
-                   const std::string &pipelineName) {
-  // Bind the config parameter into the builder to match A3's runPipeline signature.
-  auto boundPipeline = std::bind(buildPipeline, std::placeholders::_1,
-                                 std::cref(config));
+/// Run a pipeline on a module using the regbase builder and A3's runPipeline
+/// utility.
+static LogicalResult runPipelineRegBase(ModuleOp mod,
+                                        const PipelineBuilder &buildPipeline,
+                                        BiShengIRCompileMainConfig &config,
+                                        const std::string &pipelineName) {
+  // Bind the config parameter into the builder to match A3's runPipeline
+  // signature.
+  auto boundPipeline =
+      std::bind(buildPipeline, std::placeholders::_1, std::cref(config));
   return bishengir::runPipeline(mod, boundPipeline, config, pipelineName);
 }
 
@@ -329,6 +336,143 @@ bishengir::regbase::runRegBasePipeline(ModuleOp mod,
     return failure();
   }
 
+  // Validate explicit feature dependencies before the tuning retry handler.
+  const auto &attentionFusion = config.getCVPAttentionProducerFusion();
+  const unsigned attentionChains = config.getCVPAttentionReductionChains();
+  if (attentionFusion != "none" && attentionFusion != "p-state" &&
+      attentionFusion != "max-p-state") {
+    mod.emitError(
+        "CVP attention producer fusion must be none, p-state, or max-p-state");
+    return failure();
+  }
+  if (attentionChains != 1 && attentionChains != 2 && attentionChains != 4) {
+    mod.emitError("CVP attention reduction chains must be 1, 2 or 4");
+    return failure();
+  }
+  if ((config.getEnableCVPAttentionDenseP() || attentionFusion != "none" ||
+       attentionChains != 1) &&
+      !config.getEnableCVPAttentionKeyMajor()) {
+    mod.emitError("CVP attention packing, producer fusion and reduction chains "
+                  "require key-major layout");
+    return failure();
+  }
+  if (config.getEnableCVPAttentionKeyMajor()) {
+    if (!config.getAllowCVPAttentionSumReassociation()) {
+      mod.emitError("CVP attention key-major layout requires explicit FP32 sum "
+                    "reassociation permission");
+      return failure();
+    }
+    if (config.getEnableCVPAttentionRows2()) {
+      mod.emitError("CVP attention key-major layout cannot use the independent "
+                    "rows2 schedule");
+      return failure();
+    }
+    // setupHIVMPipelineOptions selects Skew from enablePreload after this
+    // validation. The input config can still carry the default Unroll value.
+    // VerifyCVPAttention later checks the schedule actually applied to the IR.
+    if (!config.getEnablePreload() || config.getDisableHfusionVectorize()) {
+      mod.emitError("CVP attention key-major layout requires Skew/preload "
+                    "CVPipeline with vectorization enabled");
+      return failure();
+    }
+  }
+  if (config.getEnableCVPAttentionDenseP() && attentionChains != 1 &&
+      attentionChains != 2) {
+    mod.emitError("CVP attention dense P requires one or two reduction chains");
+    return failure();
+  }
+  if (attentionChains == 2 &&
+      (!config.getEnableCVPAttentionDenseP() ||
+       attentionFusion != "max-p-state" ||
+       !config.getEnableCVPAttentionScoreRematerialization() ||
+       !config.getAllowCVPAttentionSumReassociation())) {
+    mod.emitError("CVP attention two-chain reduction requires dense P, fused "
+                  "max/P/state, score rematerialization and explicit FP32 sum "
+                  "reassociation");
+    return failure();
+  }
+  if (attentionChains == 2 && config.getEnableCVPQueryPipeline() &&
+      config.getCvpQueryPipelineMode() == "unroll") {
+    mod.emitError("CVP attention dense two-chain Unroll scheduling is not "
+                  "qualified");
+    return failure();
+  }
+  if (config.getEnableCVPAttentionHalfPStream() &&
+      (!config.getEnableCVPAttentionDenseP() || attentionChains != 2 ||
+       attentionFusion != "max-p-state" ||
+       !config.getEnableCVPAttentionMaxScaling() ||
+       !config.getAllowCVPAttentionSumReassociation() ||
+       config.getEnableCVPQueryPipeline() ||
+       config.getEnableCVPAttentionFirstState() ||
+       config.getEnableCVPAttentionLastOutput() ||
+       config.getEnableCVPAttentionRows2() ||
+       config.getCvpQCacheMode() != "none" ||
+       config.getEnableCVPCubeBankedReady() ||
+       config.getEnableCVPCubeOverlap() ||
+       config.getEnableCVPCubeDerivedDrain() ||
+       config.getEnableHIVMUnitFlagSync())) {
+    mod.emitError(
+        "CVP half-P streaming requires dense two-chain max/P/state, "
+        "max scaling and explicit sum reassociation, with ordinary "
+        "Skew/preload, first-state/final-output disabled, Q cache and "
+        "Cube extensions disabled, and unit_flag=False");
+    return failure();
+  }
+  if (attentionFusion == "max-p-state" &&
+      !config.getEnableCVPAttentionScoreRematerialization()) {
+    mod.emitError("CVP attention maximum producer fusion requires score "
+                  "rematerialization");
+    return failure();
+  }
+  if (config.getEnableCVPAttentionMaxScaling() &&
+      !config.getEnableCVPAttentionScoreRematerialization()) {
+    mod.emitError("CVP attention max scaling requires score rematerialization");
+    return failure();
+  }
+
+  if (config.getEnableCVPQueryStateCopyForward() &&
+      !config.getEnableCVPQueryPipeline()) {
+    mod.emitError(
+        "CVP query state copy forwarding requires the query pipeline");
+    return failure();
+  }
+  if (config.getEnableCVPQueryFinalOutputForward() &&
+      !config.getEnableCVPQueryPipeline()) {
+    mod.emitError(
+        "CVP query final output forwarding requires the query pipeline");
+    return failure();
+  }
+  if (config.getEnableCVPQueryOutputCopyForward() &&
+      (!config.getEnableCVPQueryPipeline() ||
+       !config.getEnableCVPQueryStateCopyForward() ||
+       !config.getEnableCVPQueryFinalOutputForward() ||
+       !config.getEnableVFOperandSubstitution())) {
+    mod.emitError("CVP output copy forwarding requires the query pipeline, "
+                  "state/final output forwarding and VF operand substitution");
+    return failure();
+  }
+  if (config.getEnableCVPQueryScalarInputForward() &&
+      (!config.getEnableCVPQueryPipeline() ||
+       !config.getEnableVFOperandSubstitution())) {
+    mod.emitError("CVP scalar input forwarding requires the query pipeline "
+                  "and VF operand substitution");
+    return failure();
+  }
+  if (config.getEnableCVPQueryPipeline()) {
+    if (!config.getDisableTightlyCoupledBufferReuse()) {
+      mod.emitError("CVP query pipeline requires "
+                    "--disable-tightly-coupled-buffer-reuse to preserve "
+                    "scheduled buffer lifetimes");
+      return failure();
+    }
+    if (!config.getEnableCVPAttentionKeyMajor() ||
+        config.getDisableAutoInjectBlockSync()) {
+      mod.emitError("CVP query pipeline requires key-major layout and "
+                    "cross-core synchronization");
+      return failure();
+    }
+  }
+
   // Track each address-space overflow independently so fallback can disable the
   // matching multi-buffer knob before trying coarser vector-side mitigations.
   bool hasUboverflow = false;
@@ -391,22 +535,25 @@ bishengir::regbase::runRegBasePipeline(ModuleOp mod,
     if (compileFlow == CompileFlow::Mixed) {
       success = runMixedPipelines(hirCompileMode, config);
     } else if (compileFlow == CompileFlow::PureSimt) {
-      success = runModulePipeline(hirCompileMode,
-                                  regbase::buildBiShengTTIRPipeline, config,
-                                  "BiShengSIMT");
+      success =
+          runModulePipeline(hirCompileMode, regbase::buildBiShengTTIRPipeline,
+                            config, "BiShengSIMT");
     } else {
       // Standard HIR compile path (no SIMD/SIMT split)
-      success = runModulePipeline(hirCompileMode,
-                                  regbase::buildBiShengHIRPipeline, config,
-                                  "BiShengHIR");
-      // Stop final HIVM lowering after earlier pipeline fails.
       success =
-          success && runModulePipeline(hirCompileMode,
-                                       regbase::buildFinalHIVMPipelines,
-                                       config, "buildFinalHIVMPipelines");
+          runModulePipeline(hirCompileMode, regbase::buildBiShengHIRPipeline,
+                            config, "BiShengHIR");
+      // Stop final HIVM lowering after earlier pipeline fails.
+      success = success && runModulePipeline(hirCompileMode,
+                                             regbase::buildFinalHIVMPipelines,
+                                             config, "buildFinalHIVMPipelines");
     }
     bool hasMemoryOverflow = hasUboverflow || hasCcOverflow || hasCbufOverflow;
     if (!success && hasMemoryOverflow) {
+      // No later attempt can consume another fallback policy. Keep this
+      // attempt's capacity diagnostic, including in one-attempt tuning mode.
+      if (i + 1 == tryTimes)
+        continue;
       bool flippedAnyMultiBufferKnob = false;
       if (config.getEnableAutoMultiBuffer()) {
         if (hasUboverflow && !config.getDisableMultiBufferOnUB()) {

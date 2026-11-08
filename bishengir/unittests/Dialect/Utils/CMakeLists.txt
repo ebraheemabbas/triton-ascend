@@ -2,6 +2,8 @@ add_bishengir_unittest(BiShengIRDialectUtilsTests
   ReportFatalErrorDeathTest.cpp
   SelectRoundModeTest.cpp
   UnionFindTest.cpp
+  CVPQueryScheduleTest.cpp
+  CVPCubeResourcePlanTest.cpp
 )
 
 target_link_libraries(BiShengIRDialectUtilsTests PRIVATE

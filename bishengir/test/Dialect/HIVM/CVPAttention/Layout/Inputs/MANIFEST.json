@@ -1,0 +1,35 @@
+[
+  {
+    "file": "n32768-hd64.mlir",
+    "shape": [
+      128,
+      8,
+      32768,
+      64
+    ],
+    "BN": 256,
+    "source_sha256": "c2019996cfdbe6eb9ff78dd0871cdaef5df2bf03c3fc5a7157b3bf95d833fc88"
+  },
+  {
+    "file": "n16384-hd128.mlir",
+    "shape": [
+      128,
+      8,
+      16384,
+      128
+    ],
+    "BN": 128,
+    "source_sha256": "d26f11766cc8a20c420775969806afbc3b36f28ebc4500b545e21f0bc74d298a"
+  },
+  {
+    "file": "n1024-hd128.mlir",
+    "shape": [
+      128,
+      8,
+      1024,
+      128
+    ],
+    "BN": 128,
+    "source_sha256": "c0a8125a25035a5fdc262d7c2f25d086306f5572e8ab2e2d926eee5759076963"
+  }
+]

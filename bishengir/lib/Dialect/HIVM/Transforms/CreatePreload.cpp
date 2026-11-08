@@ -19,6 +19,7 @@
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
+#include "bishengir/Dialect/HIVM/Transforms/regbase/CVPQuerySchedule.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 #include "bishengir/Dialect/MemRefExt/IR/MemRefExt.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
@@ -28,7 +29,9 @@
 
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -174,19 +177,19 @@ static bool isPreloadWorkspaceSubview(memref::SubViewOp subviewOp) {
   return hasPreloadWorkspaceMark(subviewOp.getSource());
 }
 
-static Value
-cloneWorkspaceSubview(memref::SubViewOp subviewOp, size_t preloadNum,
-                      PreloadInfo &info, OpBuilder &b) {
+static Value cloneWorkspaceSubview(memref::SubViewOp subviewOp,
+                                   size_t preloadNum, PreloadInfo &info,
+                                   OpBuilder &b) {
   auto offsets = subviewOp.getMixedOffsets();
   auto loc = subviewOp.getLoc();
 
   auto indVar = info.mappings[preloadNum].lookup(info.indVar);
 
   Value offset = b.create<arith::DivSIOp>(indVar.getLoc(), indVar, info.step);
-  offset = b.create<arith::RemSIOp>(offset.getLoc(), offset,
-                                    info.maxPreloadValue);
-  offset = b.create<arith::IndexCastOp>(offset.getLoc(), b.getIndexType(),
-                                        offset);
+  offset =
+      b.create<arith::RemSIOp>(offset.getLoc(), offset, info.maxPreloadValue);
+  offset =
+      b.create<arith::IndexCastOp>(offset.getLoc(), b.getIndexType(), offset);
   offsets[0] = offset;
 
   auto src = info.mappings[preloadNum].lookupOrDefault(subviewOp.getSource());
@@ -276,7 +279,7 @@ static void rewriteBody(Block *body, PreloadInfo &info, OpBuilder &b) {
         pointerCastOp && getPreloadLocalBufferNum(pointerCastOp, info)) {
       cloneLocalBuffer(pointerCastOp, pointerCastOp, info.preloadNum, info, b);
     } else if (auto subviewOp = dyn_cast<memref::SubViewOp>(&op);
-              subviewOp && isPreloadWorkspaceSubview(subviewOp)) {
+               subviewOp && isPreloadWorkspaceSubview(subviewOp)) {
       cloneWorkspaceSubview(subviewOp, info.preloadNum, info, b);
     } else if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
       auto &mapping = info.mappings[info.preloadNum];
@@ -298,6 +301,8 @@ static void rewriteBody(Block *body, PreloadInfo &info, OpBuilder &b) {
           });
       info.mappings[info.preloadNum].map(forOp->getResults(),
                                          newForOp->getResults());
+      // This is source provenance only. Logical iteration values remain in
+      // the per-access binding marks cloned through the stage's IRMapping.
     } else {
       b.clone(op, info.mappings[info.preloadNum]);
     }
@@ -311,6 +316,204 @@ static Value lookThroughScopeResult(Value value) {
     value = returnOp.getResults()[cast<OpResult>(value).getResultNumber()];
   }
   return value;
+}
+
+// Bufferization can return a selected state buffer through copies instead of
+// directly yielding the scope result. An inactive pipeline stage must preserve
+// that state's previous iteration value, not select a newly allocated buffer
+// whose producer did not execute. This is logical value forwarding only; it
+// neither changes the planned addresses nor establishes physical lifetimes.
+static bool hasSameStaticElements(Value lhs, Value rhs) {
+  auto a = dyn_cast<MemRefType>(lhs.getType());
+  auto b = dyn_cast<MemRefType>(rhs.getType());
+  return a && b && a.hasStaticShape() && b.hasStaticShape() &&
+         a.getElementType() == b.getElementType() &&
+         a.getNumElements() == b.getNumElements();
+}
+
+static Value getWholeBufferViewSource(Operation *op) {
+  if (!isa<memref::CastOp, memref::CollapseShapeOp, memref::ExpandShapeOp>(op))
+    return {};
+  Value source = op->getOperand(0);
+  return hasSameStaticElements(source, op->getResult(0)) ? source : Value{};
+}
+
+static std::pair<Value, Value> getWholeBufferCopy(Operation *op) {
+  Value source, target;
+  if (auto copy = dyn_cast<hivm::CopyOp>(op)) {
+    source = copy.getSrc();
+    target = copy.getDst();
+  } else if (auto copy = dyn_cast<memref::CopyOp>(op)) {
+    source = copy.getSource();
+    target = copy.getTarget();
+  }
+  if (!source || !hasSameStaticElements(source, target))
+    return {};
+  return {source, target};
+}
+
+static SmallVector<Value> getWholeBufferAliases(Value value) {
+  SmallVector<Value> aliases{value};
+  for (unsigned i = 0; i < aliases.size(); ++i) {
+    Value current = aliases[i];
+    auto add = [&](Value candidate) {
+      if (candidate && !llvm::is_contained(aliases, candidate))
+        aliases.push_back(candidate);
+    };
+    if (Operation *def = current.getDefiningOp())
+      add(getWholeBufferViewSource(def));
+    for (Operation *user : current.getUsers())
+      if (getWholeBufferViewSource(user) == current)
+        add(user->getResult(0));
+  }
+  return aliases;
+}
+
+static Operation *getLoopBodyAncestor(Operation *op, scf::ForOp loop) {
+  while (op && op->getBlock() != loop.getBody())
+    op = op->getParentOp();
+  return op;
+}
+
+static SmallVector<Value> getAliasesForWriteCheck(Value value,
+                                                  scf::ForOp loop) {
+  SmallVector<Value> aliases{value};
+  for (unsigned i = 0; i < aliases.size(); ++i) {
+    Value current = aliases[i];
+    auto add = [&](Value candidate) {
+      if (candidate && isa<BaseMemRefType>(candidate.getType()) &&
+          !llvm::is_contained(aliases, candidate))
+        aliases.push_back(candidate);
+    };
+    if (auto view = current.getDefiningOp<ViewLikeOpInterface>())
+      add(view.getViewSource());
+    for (OpOperand &use : current.getUses()) {
+      Operation *user = use.getOwner();
+      if (auto view = dyn_cast<ViewLikeOpInterface>(user)) {
+        if (view.getViewSource() == current)
+          for (Value result : user->getResults())
+            add(result);
+      } else if (auto select = dyn_cast<arith::SelectOp>(user)) {
+        add(select.getResult());
+      } else if (isa<scope::ReturnOp>(user)) {
+        add(user->getParentOp()->getResult(use.getOperandNumber()));
+      } else if (isa<scf::YieldOp>(user) &&
+                 user->getParentOp() != loop.getOperation()) {
+        if (isa<scf::IfOp>(user->getParentOp()))
+          add(user->getParentOp()->getResult(use.getOperandNumber()));
+      }
+    }
+  }
+  return aliases;
+}
+
+static bool isUnmodifiedBetween(Value value, Operation *from, Operation *until,
+                                scf::ForOp loop) {
+  for (Value alias : getAliasesForWriteCheck(value, loop)) {
+    for (Operation *user : alias.getUsers()) {
+      Operation *position = getLoopBodyAncestor(user, loop);
+      if (!position || position == from || position == until ||
+          !from->isBeforeInBlock(position) || !position->isBeforeInBlock(until))
+        continue;
+      if (isa<ViewLikeOpInterface, arith::SelectOp, annotation::MarkOp,
+              scf::YieldOp, scope::ReturnOp>(user))
+        continue;
+      if (auto [source, target] = getWholeBufferCopy(user); source) {
+        if (target == alias)
+          return false;
+        continue;
+      }
+      auto effects = dyn_cast<MemoryEffectOpInterface>(user);
+      if (!effects)
+        return false;
+      SmallVector<MemoryEffects::EffectInstance> instances;
+      effects.getEffects(instances);
+      for (const auto &effect : instances)
+        if ((!effect.getValue() || effect.getValue() == alias) &&
+            !isa<MemoryEffects::Read>(effect.getEffect()))
+          return false;
+    }
+  }
+  return true;
+}
+
+static bool reachesOnlyStateYield(Value result, scope::ScopeOp scope,
+                                  scf::ForOp loop, unsigned stateIndex) {
+  SmallVector<std::pair<Value, Operation *>> work{{result, scope}};
+  bool found = false;
+  for (unsigned i = 0; i < work.size(); ++i) {
+    auto [value, origin] = work[i];
+    for (Value alias : getWholeBufferAliases(value)) {
+      for (OpOperand &use : alias.getUses()) {
+        Operation *user = use.getOwner();
+        if (user == loop.getBody()->getTerminator()) {
+          if (use.getOperandNumber() != stateIndex ||
+              !isUnmodifiedBetween(value, origin, user, loop))
+            return false;
+          found = true;
+          continue;
+        }
+        if (user->getBlock() != loop.getBody() ||
+            !origin->isBeforeInBlock(user))
+          continue;
+        auto [source, target] = getWholeBufferCopy(user);
+        if (source != alias || !isUnmodifiedBetween(value, origin, user, loop))
+          continue;
+        auto next = std::make_pair(target, user);
+        if (!llvm::is_contained(work, next))
+          work.push_back(next);
+      }
+    }
+  }
+  return found;
+}
+
+static Value getSkippedLoopState(Value result, scope::ScopeOp scope) {
+  auto loop = dyn_cast<scf::ForOp>(scope->getParentOp());
+  if (!loop)
+    return {};
+  Value direct;
+  for (OpOperand &use : result.getUses()) {
+    if (use.getOwner() != loop.getBody()->getTerminator())
+      continue;
+    Value previous = loop.getRegionIterArgs()[use.getOperandNumber()];
+    if (direct && direct != previous)
+      return {};
+    direct = previous;
+  }
+  if (direct)
+    return direct;
+
+  auto selected =
+      lookThroughScopeResult(result).getDefiningOp<arith::SelectOp>();
+  if (!selected)
+    return {};
+  auto trueArg = dyn_cast<BlockArgument>(selected.getTrueValue());
+  auto falseArg = dyn_cast<BlockArgument>(selected.getFalseValue());
+  bool trueState = trueArg && trueArg.getOwner() == loop.getBody() &&
+                   trueArg != loop.getInductionVar();
+  bool falseState = falseArg && falseArg.getOwner() == loop.getBody() &&
+                    falseArg != loop.getInductionVar();
+  if (trueState == falseState)
+    return {};
+  BlockArgument previous = trueState ? trueArg : falseArg;
+  unsigned index = previous.getArgNumber() - 1;
+  if (previous.getType() != result.getType() ||
+      !reachesOnlyStateYield(result, scope, loop, index))
+    return {};
+  return previous;
+}
+
+static bool canRematerializeViewResult(Value value, scope::ScopeOp scope) {
+  value = lookThroughScopeResult(value);
+  Region *region = value.getParentRegion();
+  if (!region || !scope.getRegion().isAncestor(region))
+    return true;
+  Operation *def = value.getDefiningOp();
+  return isRematerializableAliasOp(def) &&
+         llvm::all_of(def->getOperands(), [&](Value operand) {
+           return canRematerializeViewResult(operand, scope);
+         });
 }
 
 static void emitRematerializationError(Operation *definingOp,
@@ -367,8 +570,8 @@ rematerializeViewLikeResult(Value value, scope::ScopeOp scopeOp,
 }
 
 static scf::IfOp rewriteScopeOp(Value cond, scope::ScopeOp scopeOp,
-                                PreloadInfo &info, ValueRange loopArgs,
-                                Location loc, OpBuilder &builder) {
+                                PreloadInfo &info, Location loc,
+                                OpBuilder &builder) {
   auto &scopeBody = scopeOp.getRegion().front();
   auto returnResults =
       cast<scope::ReturnOp>(scopeBody.getTerminator()).getResults();
@@ -400,9 +603,9 @@ static scf::IfOp rewriteScopeOp(Value cond, scope::ScopeOp scopeOp,
         for (auto [res, retRes] :
              llvm::zip_equal(scopeOp->getResults(), returnResults)) {
           if (!getLocalBuffer(retRes)) {
-            if (res.hasOneUse() && isa<scf::YieldOp>(*res.user_begin())) {
-              auto oprNum = res.use_begin()->getOperandNumber();
-              newYields.push_back(loopArgs[oprNum]);
+            if (Value previous = getSkippedLoopState(res, scopeOp)) {
+              newYields.push_back(
+                  info.mappings[info.preloadNum].lookupOrDefault(previous));
             } else if (auto pointerCastOp =
                            retRes.getDefiningOp<hivm::PointerCastOp>()) {
               auto newRes = b.clone(*pointerCastOp)->getResult(0);
@@ -424,8 +627,128 @@ static scf::IfOp rewriteScopeOp(Value cond, scope::ScopeOp scopeOp,
 
 static bool isSynchronizationOp(Operation *op) {
   return isa<hivm::SetFlagOp, hivm::WaitFlagOp, hivm::PipeBarrierOp,
-             hivm::SyncBlockOp, hivm::SyncBlockSetOp,
-             hivm::SyncBlockWaitOp>(op);
+             hivm::SyncBlockOp, hivm::SyncBlockSetOp, hivm::SyncBlockWaitOp>(
+      op);
+}
+
+// One logical issue tick. Both emitters use the same checked inactive-state,
+// view rematerialization and physical-ring selection rules. A new mapping per
+// tick prevents the next Unroll lane from reading the preceding lane's SSA.
+static SmallVector<Value> materializeScheduledTick(
+    scf::ForOp forOp, DenseMap<Operation *, size_t> &scopeToIdx,
+    DenseMap<Value, hivm::PointerCastOp> &valueToAdapt, PreloadInfo &info,
+    Value indVar, ValueRange args, OpBuilder &b, Location loc,
+    bool filterAdaptedState = false) {
+  const size_t maxPreloadNum = info.maxPreloadNum;
+  info.mappings.clear();
+  info.mappings.resize(maxPreloadNum);
+  Value curIndVar = indVar;
+  info.indVar = forOp.getInductionVar();
+  for (int64_t preloadNum = maxPreloadNum - 1; preloadNum >= 0; preloadNum--) {
+    info.mappings[preloadNum].map(info.indVar, curIndVar);
+    auto newArgIter = args.begin();
+    for (auto oldArg : forOp.getRegionIterArgs()) {
+      if (auto it = valueToAdapt.find(oldArg); it != valueToAdapt.end()) {
+        auto pointerCastOp = it->second;
+        cloneLocalBuffer(oldArg, pointerCastOp, preloadNum, info, b);
+      } else {
+        info.mappings[preloadNum].map(oldArg, *newArgIter);
+        ++newArgIter;
+      }
+    }
+    curIndVar =
+        b.createOrFold<arith::SubIOp>(curIndVar.getLoc(), curIndVar, info.step);
+  }
+
+  for (auto &bodyOp : forOp.getBody()->without_terminator()) {
+    if (!scopeToIdx.contains(&bodyOp)) {
+      if (isSynchronizationOp(&bodyOp)) {
+        b.clone(bodyOp, info.mappings[maxPreloadNum - 1]);
+        continue;
+      }
+      if (auto pointerCastOp = dyn_cast<hivm::PointerCastOp>(&bodyOp)) {
+        if (getPreloadLocalBufferNum(pointerCastOp, info)) {
+          for (int64_t preloadNum = maxPreloadNum - 1; preloadNum >= 0;
+               preloadNum--) {
+            cloneLocalBuffer(pointerCastOp, pointerCastOp, preloadNum, info, b);
+          }
+          continue;
+        }
+      } else if (auto subviewOp = dyn_cast<memref::SubViewOp>(&bodyOp);
+                 subviewOp && isPreloadWorkspaceSubview(subviewOp)) {
+        for (int64_t preloadNum = maxPreloadNum - 1; preloadNum >= 0;
+             preloadNum--) {
+          cloneWorkspaceSubview(subviewOp, preloadNum, info, b);
+        }
+        continue;
+      }
+      for (auto &mapping : info.mappings)
+        b.clone(bodyOp, mapping);
+      continue;
+    }
+    auto scopeOp = cast<scope::ScopeOp>(&bodyOp);
+    info.preloadNum = scopeToIdx.at(&bodyOp);
+
+    LDBG("Handling preload scope: " << info.preloadNum << "\n" << bodyOp);
+
+    auto loc = scopeOp.getLoc();
+    Value cond = getPreloadCondition(info, loc, b);
+
+    auto newOp = rewriteScopeOp(cond, scopeOp, info, loc, b);
+    auto returnResults =
+        cast<scope::ReturnOp>(scopeOp.getRegion().front().getTerminator())
+            .getResults();
+    auto scopeResIter = scopeOp.result_begin();
+    SmallVector<IRMapping> viewMappings(info.mappings.size());
+    for (auto newRes : newOp->getResults()) {
+      auto maybeLocalBuffer = getLocalBuffer(*scopeResIter);
+      while (maybeLocalBuffer.has_value()) {
+        for (auto &mapping : info.mappings)
+          mapping.map(*scopeResIter, mapping.lookup(maybeLocalBuffer.value()));
+        ++scopeResIter;
+        maybeLocalBuffer = getLocalBuffer(*scopeResIter);
+      }
+
+      Value scopeRes = *scopeResIter;
+      auto resultNumber = cast<OpResult>(scopeRes).getResultNumber();
+      Value returnResult = returnResults[resultNumber];
+      Value source = lookThroughScopeResult(returnResult);
+      if (!isa_and_nonnull<ViewLikeOpInterface>(source.getDefiningOp())) {
+        for (auto &mapping : info.mappings)
+          mapping.map(scopeRes, newRes);
+      } else {
+        for (auto [mapping, viewMapping] :
+             llvm::zip_equal(info.mappings, viewMappings)) {
+          auto rematerialized = rematerializeViewLikeResult(
+              returnResult, scopeOp, mapping, viewMapping, b);
+          assert(succeeded(rematerialized) &&
+                 "Failed to rematerialize checked scope result");
+          mapping.map(scopeRes, *rematerialized);
+        }
+      }
+      ++scopeResIter;
+    }
+    for (; scopeResIter != scopeOp.result_end(); ++scopeResIter) {
+      auto maybeLocalBuffer = getLocalBuffer(*scopeResIter);
+      for (auto &mapping : info.mappings)
+        mapping.map(*scopeResIter, mapping.lookup(maybeLocalBuffer.value()));
+    }
+  }
+
+  SmallVector<Value> newYields;
+  if (!args.empty()) {
+    newYields = llvm::map_to_vector(forOp.getYieldedValues(), [&](Value yield) {
+      return info.mappings[maxPreloadNum - 1].lookupOrDefault(yield);
+    });
+  }
+  if (filterAdaptedState && !valueToAdapt.empty()) {
+    SmallVector<Value> filtered;
+    for (auto [index, argument] : llvm::enumerate(forOp.getRegionIterArgs()))
+      if (!valueToAdapt.contains(argument))
+        filtered.push_back(newYields[index]);
+    newYields = std::move(filtered);
+  }
+  return newYields;
 }
 
 static void rewritePreloadLoop(scf::ForOp forOp,
@@ -462,113 +785,13 @@ static void rewritePreloadLoop(scf::ForOp forOp,
   auto newForOp = rewriter.create<scf::ForOp>(
       forOp.getLoc(), info.lb, newUpperbound, info.step, newInitArgs,
       [&](OpBuilder &b, Location loc, Value indVar, ValueRange args) {
-        Value curIndVar = indVar;
-        info.indVar = forOp.getInductionVar();
-        for (int64_t preloadNum = maxPreloadNum - 1; preloadNum >= 0;
-             preloadNum--) {
-          info.mappings[preloadNum].map(info.indVar, curIndVar);
-          auto newArgIter = args.begin();
-          for (auto oldArg : forOp.getRegionIterArgs()) {
-            if (auto it = valueToAdapt.find(oldArg); it != valueToAdapt.end()) {
-              auto pointerCastOp = it->second;
-              cloneLocalBuffer(oldArg, pointerCastOp, preloadNum, info, b);
-            } else {
-              info.mappings[preloadNum].map(oldArg, *newArgIter);
-              ++newArgIter;
-            }
-          }
-          curIndVar = b.createOrFold<arith::SubIOp>(curIndVar.getLoc(),
-                                                    curIndVar, info.step);
-        }
-
-        for (auto &bodyOp : forOp.getBody()->without_terminator()) {
-          if (!scopeToIdx.contains(&bodyOp)) {
-            if (isSynchronizationOp(&bodyOp)) {
-              b.clone(bodyOp, info.mappings[maxPreloadNum - 1]);
-              continue;
-            }
-            if (auto pointerCastOp = dyn_cast<hivm::PointerCastOp>(&bodyOp)) {
-              if (getPreloadLocalBufferNum(pointerCastOp, info)) {
-                for (int64_t preloadNum = maxPreloadNum - 1; preloadNum >= 0;
-                     preloadNum--) {
-                  cloneLocalBuffer(pointerCastOp, pointerCastOp, preloadNum,
-                                   info, b);
-                }
-                continue;
-              }
-            } else if (auto subviewOp = dyn_cast<memref::SubViewOp>(&bodyOp);
-                      subviewOp && isPreloadWorkspaceSubview(subviewOp)) {
-              for (int64_t preloadNum = maxPreloadNum - 1; preloadNum >= 0;
-                  preloadNum--) {
-                cloneWorkspaceSubview(subviewOp, preloadNum, info, b);
-              }
-              continue;
-            }
-            for (auto &mapping : info.mappings)
-              b.clone(bodyOp, mapping);
-            continue;
-          }
-          auto scopeOp = cast<scope::ScopeOp>(&bodyOp);
-          info.preloadNum = scopeToIdx.at(&bodyOp);
-
-          LDBG("Handling preload scope: " << info.preloadNum << "\n" << bodyOp);
-
-          auto loc = scopeOp.getLoc();
-          Value cond = getPreloadCondition(info, loc, b);
-
-          auto newOp = rewriteScopeOp(cond, scopeOp, info, args, loc, b);
-          auto returnResults = cast<scope::ReturnOp>(
-                                   scopeOp.getRegion().front().getTerminator())
-                                   .getResults();
-          auto scopeResIter = scopeOp.result_begin();
-          SmallVector<IRMapping> viewMappings(info.mappings.size());
-          for (auto newRes : newOp->getResults()) {
-            auto maybeLocalBuffer = getLocalBuffer(*scopeResIter);
-            while (maybeLocalBuffer.has_value()) {
-              for (auto &mapping : info.mappings)
-                mapping.map(*scopeResIter,
-                            mapping.lookup(maybeLocalBuffer.value()));
-              ++scopeResIter;
-              maybeLocalBuffer = getLocalBuffer(*scopeResIter);
-            }
-
-            Value scopeRes = *scopeResIter;
-            auto resultNumber = cast<OpResult>(scopeRes).getResultNumber();
-            Value returnResult = returnResults[resultNumber];
-            Value source = lookThroughScopeResult(returnResult);
-            if (!isa_and_nonnull<ViewLikeOpInterface>(source.getDefiningOp())) {
-              for (auto &mapping : info.mappings)
-                mapping.map(scopeRes, newRes);
-            } else {
-              for (auto [mapping, viewMapping] :
-                   llvm::zip_equal(info.mappings, viewMappings)) {
-                auto rematerialized = rematerializeViewLikeResult(
-                    returnResult, scopeOp, mapping, viewMapping, b);
-                assert(succeeded(rematerialized) &&
-                       "Failed to rematerialize checked scope result");
-                mapping.map(scopeRes, *rematerialized);
-              }
-            }
-            ++scopeResIter;
-          }
-          for (; scopeResIter != scopeOp.result_end(); ++scopeResIter) {
-            auto maybeLocalBuffer = getLocalBuffer(*scopeResIter);
-            for (auto &mapping : info.mappings)
-              mapping.map(*scopeResIter,
-                          mapping.lookup(maybeLocalBuffer.value()));
-          }
-        }
-
-        SmallVector<Value> newYields;
-        if (!newInitArgs.empty()) {
-          newYields =
-              llvm::map_to_vector(forOp.getYieldedValues(), [&](Value yield) {
-                return info.mappings[maxPreloadNum - 1].lookupOrDefault(yield);
-              });
-        }
+        auto newYields = materializeScheduledTick(
+            forOp, scopeToIdx, valueToAdapt, info, indVar, args, b, loc);
         b.create<scf::YieldOp>(loc, newYields);
       });
 
+  // Do not stamp the original local clock onto the shifted IV. The paired
+  // origin can repeat across clones; binding SSA establishes each generation.
   LDBG("New for loop:\n" << newForOp);
 
   SmallVector<Value> newRes;
@@ -582,6 +805,175 @@ static void rewritePreloadLoop(scf::ForOp forOp,
     }
   }
   rewriter.replaceOp(forOp, newRes);
+}
+
+static LogicalResult
+validateContinuousQueryUnroll(scf::ForOp loop, ArrayRef<scope::ScopeOp> scopes,
+                              unsigned factor) {
+  auto reject = [&](StringRef message) {
+    loop.emitError("continuous Unroll: ") << message;
+    return failure();
+  };
+  auto stream = loop->getAttrOfType<DictionaryAttr>("hivm.cvp_query.stream");
+  auto mode = stream ? stream.getAs<StringAttr>("pipeline_mode") : StringAttr();
+  auto lanes = stream ? stream.getAs<IntegerAttr>("key_unroll") : IntegerAttr();
+  auto physical = stream ? stream.getAs<BoolAttr>("physical_lifetimes_verified")
+                         : BoolAttr();
+  if (!mode || mode.getValue() != "unroll" || !lanes ||
+      lanes.getInt() != factor || !physical || physical.getValue())
+    return reject("missing typed stream or unsupported ownership certificate");
+  auto keys = stream.getAs<IntegerAttr>("key_count");
+  auto bn = stream.getAs<IntegerAttr>("key_step");
+  auto queryUpper = stream.getAs<IntegerAttr>("query_upper");
+  auto queryStep = stream.getAs<IntegerAttr>("query_step");
+  if (!keys || !bn || !queryUpper || !queryStep)
+    return reject("missing original query/key geometry");
+  std::string reason;
+  auto schedule =
+      CVPQuerySchedule::create(keys.getInt(), bn.getInt(), queryUpper.getInt(),
+                               queryStep.getInt(), reason);
+  if (!schedule || !schedule->canEmitQueryUnroll(factor))
+    return reject("unsupported query domain or overflowing group bound");
+  if (scopes.size() != CVPQuerySchedule::kStageCount ||
+      !loop.getInductionVar().getType().isInteger(64) ||
+      getConstantIntValue(loop.getLowerBound()) != 0 ||
+      getConstantIntValue(loop.getStep()) != bn.getInt() ||
+      loop->hasAttr("unsignedCmp"))
+    return reject("expected the signed widened stream and original key step");
+  auto core = queryFuncCoreType(loop->getParentOfType<func::FuncOp>())
+                  .value_or(TFuncCoreType::AIC_OR_AIV);
+  for (auto [index, scope] : llvm::enumerate(scopes)) {
+    bool cubeStage = index % 2 == 1;
+    bool expected = core == TFuncCoreType::AIC   ? cubeStage
+                    : core == TFuncCoreType::AIV ? !cubeStage
+                                                 : true;
+    if (static_cast<bool>(scope) != expected)
+      return reject("missing or wrong-core stage after MIX splitting");
+    if (!scope)
+      continue;
+    auto value =
+        scope->getAttrOfType<IntegerAttr>("hivm.cvp_query.unroll_factor");
+    if (!value || value.getInt() != factor)
+      return reject("stage lane factors disagree");
+    auto stageCore = scope->getAttrOfType<TCoreTypeAttr>("hivm.loop_core_type");
+    if (!stageCore || stageCore.getTcoretype() !=
+                          (cubeStage ? TCoreType::CUBE : TCoreType::VECTOR))
+      return reject("stage core assignment disagrees with logical role");
+  }
+  for (Value value : loop.getInitArgs())
+    if (isa<TensorType>(value.getType()))
+      return reject("query state must be bufferized before direct emission");
+  // Do not duplicate an unknown effect outside its guarded stage. Whole-buffer
+  // state copies and planned pointer/view operations use the existing rules.
+  for (Operation &operation : loop.getBody()->without_terminator()) {
+    if (isa<scope::ScopeOp>(operation) || isSynchronizationOp(&operation) ||
+        isMemoryEffectFree(&operation) || isa<hivm::PointerCastOp>(operation) ||
+        getWholeBufferCopy(&operation).first)
+      continue;
+    return reject("unknown effect outside a scheduled stage");
+  }
+  return success();
+}
+
+// Direct continuous-query Unroll specialization. This emits ordinary U1/U2/U4
+// issue groups from the typed stages; it does not run the Skew emitter or apply
+// a generic loop-unroll pass to its output. Lanes execute in issue order and
+// explicitly thread all carried state. Keeping complete issue ticks together
+// preserves the two-query storage contract even when one group crosses several
+// short query boundaries. The unrelated legacy Unroll emitter remains
+// unchanged.
+static LogicalResult rewriteContinuousQueryUnroll(
+    scf::ForOp forOp, SmallVector<scope::ScopeOp, 4> scopes, unsigned factor) {
+  if (failed(validateContinuousQueryUnroll(forOp, scopes, factor)))
+    return failure();
+  IRRewriter rewriter(forOp.getContext());
+  PreloadInfo info;
+  info.funcCoreType = queryFuncCoreType(forOp->getParentOfType<func::FuncOp>())
+                          .value_or(TFuncCoreType::AIC_OR_AIV);
+  info.lb = forOp.getLowerBound();
+  info.ub = forOp.getUpperBound();
+  info.step = forOp.getStep();
+  info.maxPreloadNum = CVPQuerySchedule::kStageCount;
+  rewriter.setInsertionPoint(forOp);
+  info.maxPreloadValue = rewriter.create<arith::ConstantOp>(
+      forOp.getLoc(), rewriter.getI64IntegerAttr(info.maxPreloadNum));
+  collectPreloadLocalBuffers(forOp->getParentOfType<func::FuncOp>(), info);
+  SmallVector<Value> initialState;
+  DenseMap<Value, hivm::PointerCastOp> adapted;
+  Value conservativeEnd =
+      preprocessLoopArgs(forOp, initialState, adapted, info, rewriter);
+  for (auto [index, argument] : llvm::enumerate(forOp.getRegionIterArgs())) {
+    if (adapted.contains(argument) && !forOp.getResult(index).use_empty()) {
+      forOp.emitError("continuous Unroll cannot expose an adapted local-ring "
+                      "result after the stream");
+      return failure();
+    }
+  }
+  // Preserve the common conservative stage drain; trimming its synchronization
+  // is Stage 9. Empty assignments have no issue ticks, including no empty tail.
+  Value nonEmpty = rewriter.create<arith::CmpIOp>(
+      forOp.getLoc(), arith::CmpIPredicate::slt, info.lb, info.ub);
+  Value issueEnd = rewriter.create<arith::SelectOp>(forOp.getLoc(), nonEmpty,
+                                                    conservativeEnd, info.lb);
+  int64_t keyStep = *getConstantIntValue(info.step);
+  Value groupStep = rewriter.create<arith::ConstantOp>(
+      forOp.getLoc(), rewriter.getI64IntegerAttr(keyStep * factor));
+  DenseMap<Operation *, size_t> scopeToIdx;
+  for (auto [index, scope] : llvm::enumerate(scopes))
+    if (scope)
+      scopeToIdx[scope] = index;
+  auto grouped = rewriter.create<scf::ForOp>(
+      forOp.getLoc(), info.lb, issueEnd, groupStep, initialState,
+      [&](OpBuilder &builder, Location loc, Value base, ValueRange arguments) {
+        SmallVector<Value> state(arguments.begin(), arguments.end());
+        for (unsigned lane = 0; lane < factor; ++lane) {
+          Value offset = builder.create<arith::ConstantOp>(
+              loc, builder.getI64IntegerAttr(lane * keyStep));
+          Value tick = builder.create<arith::AddIOp>(loc, base, offset);
+          Value valid = builder.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::slt, tick, issueEnd);
+          auto guarded = builder.create<scf::IfOp>(
+              loc, valid,
+              [&](OpBuilder &body, Location bodyLoc) {
+                auto next =
+                    materializeScheduledTick(forOp, scopeToIdx, adapted, info,
+                                             tick, state, body, bodyLoc,
+                                             /*filterAdaptedState=*/true);
+                body.create<scf::YieldOp>(bodyLoc, next);
+              },
+              [&](OpBuilder &body, Location bodyLoc) {
+                body.create<scf::YieldOp>(bodyLoc, state);
+              });
+          guarded->setAttr("hivm.cvp_query.unroll_lane",
+                           builder.getI32IntegerAttr(lane));
+          state.assign(guarded.getResults().begin(),
+                       guarded.getResults().end());
+        }
+        builder.create<scf::YieldOp>(loc, state);
+      });
+  grouped->setAttr(hivm::kCVUnrolledLoopName, rewriter.getUnitAttr());
+  grouped->setAttr("hivm.cvp_attention.applied",
+                   rewriter.getStringAttr("unroll"));
+  grouped->setAttr("hivm.cvp_query.stream",
+                   forOp->getAttr("hivm.cvp_query.stream"));
+  grouped->setAttr(
+      "hivm.cvp_query.unroll_emitted",
+      rewriter.getDictionaryAttr(
+          {rewriter.getNamedAttr("lanes", rewriter.getI32IntegerAttr(factor)),
+           rewriter.getNamedAttr("lane_order", rewriter.getStringAttr("issue")),
+           rewriter.getNamedAttr("ownership_required",
+                                 rewriter.getBoolAttr(true))}));
+  // Preserve Stage 6's symbolic origin without stamping it onto shifted IVs.
+  SmallVector<Value> replacements;
+  unsigned resultIndex = 0;
+  for (auto argument : forOp.getRegionIterArgs()) {
+    if (auto found = adapted.find(argument); found != adapted.end())
+      replacements.push_back(found->second);
+    else
+      replacements.push_back(grouped.getResult(resultIndex++));
+  }
+  rewriter.replaceOp(forOp, replacements);
+  return success();
 }
 
 struct PropagateAdaptor : public OpRewritePattern<UnrealizedConversionCastOp> {
@@ -647,7 +1039,49 @@ static void cleanupPreloadWorkspaceMarks(Operation &op) {
 }
 
 void CreatePreloadPass::runOnOperation() {
-  auto moduleOp = getOperation();
+  ModuleOp original = cast<ModuleOp>(getOperation());
+  bool directUnroll = false;
+  original.walk([&](scope::ScopeOp scope) {
+    directUnroll |= scope->hasAttr("hivm.cvp_query.unroll_factor");
+  });
+  // An unsupported function or late materialization failure must not leave
+  // another function partly transformed. The disabled/legacy path keeps its
+  // existing operation identity and emitted IR.
+  OwningOpRef<ModuleOp> candidate;
+  ModuleOp moduleOp = original;
+  const bool transactional = directUnroll;
+  if (transactional) {
+    candidate = OwningOpRef<ModuleOp>(cast<ModuleOp>(original->clone()));
+    moduleOp = *candidate;
+  }
+  bool invalid = false;
+  if (transactional) {
+    moduleOp.walk([&](scope::ScopeOp scope) {
+      bool marked = scope->hasAttr("hivm.cvp_query.unroll_factor");
+      if (!marked && !scope->hasAttr(hivm::PreloadNumAttr::name) &&
+          !scope->hasAttr(hivm::MaxPreloadNumAttr::name))
+        return;
+      auto parent = dyn_cast<scf::ForOp>(scope->getParentOp());
+      auto lanes =
+          scope->getAttrOfType<IntegerAttr>("hivm.cvp_query.unroll_factor");
+      auto maximum =
+          scope->getAttrOfType<IntegerAttr>(hivm::MaxPreloadNumAttr::name);
+      auto index =
+          scope->getAttrOfType<IntegerAttr>(hivm::PreloadNumAttr::name);
+      bool badMode = marked && (!lanes ||
+                                (lanes.getInt() != 1 && lanes.getInt() != 2 &&
+                                 lanes.getInt() != 4) ||
+                                !maximum || maximum.getInt() != 4);
+      if (!parent || badMode || !maximum || maximum.getInt() <= 0 ||
+          maximum.getInt() > 4096 || !index || index.getInt() < 0 ||
+          index.getInt() >= maximum.getInt()) {
+        scope.emitOpError("malformed continuous-Unroll stage metadata");
+        invalid = true;
+      }
+    });
+    if (invalid)
+      return signalPassFailure();
+  }
   DenseMap<scf::ForOp, SmallVector<scope::ScopeOp, 4>> preload;
   moduleOp->walk([&](scope::ScopeOp scopeOp) {
     if (auto maxPreloadNumAttr = scopeOp->getAttrOfType<IntegerAttr>(
@@ -663,12 +1097,37 @@ void CreatePreloadPass::runOnOperation() {
       assert(preloadNum >= 0 && "PreloadNum must be non-negative integer");
       assert(preloadNum < static_cast<int64_t>(preloadVec.size()) &&
              "MaxPreloadNumAttr must be set");
+      if (transactional && preloadVec[preloadNum]) {
+        scopeOp.emitOpError("duplicate stage in continuous-Unroll module");
+        invalid = true;
+      }
       preloadVec[preloadNum] = scopeOp;
     }
   });
+  if (invalid)
+    return signalPassFailure();
 
   if (preload.empty())
     return;
+
+  // Validate every inactive branch before mutating any preload loop. Do not
+  // replace an unsupported selected state with an uninitialized pointer.
+  for (auto &[forOp, scopes] : preload) {
+    for (scope::ScopeOp scope : scopes) {
+      if (!scope)
+        continue;
+      for (Value result : scope.getResults()) {
+        Value returned = lookThroughScopeResult(result);
+        if (getLocalBuffer(returned) || getSkippedLoopState(result, scope) ||
+            canRematerializeViewResult(returned, scope))
+          continue;
+        scope.emitOpError("cannot preserve a preload scope result in the "
+                          "inactive stage: expected a carried state through "
+                          "unmodified whole-buffer copies or a supported view");
+        return signalPassFailure();
+      }
+    }
+  }
 
   for (auto &[forOp, scopes] : preload) {
     LDBG("Processing preload:\n" << forOp);
@@ -676,11 +1135,23 @@ void CreatePreloadPass::runOnOperation() {
       return static_cast<bool>(scopeOp);
     });
     assert(scopeIt != scopes.end() && "Expected at least one preload scope");
-    auto maxPreloadNumAttr = (*scopeIt)->getAttrOfType<IntegerAttr>(
-        hivm::MaxPreloadNumAttr::name);
+    auto maxPreloadNumAttr =
+        (*scopeIt)->getAttrOfType<IntegerAttr>(hivm::MaxPreloadNumAttr::name);
     assert(maxPreloadNumAttr && "MaxPreloadNumAttr must be set");
-    rewritePreloadLoop(forOp, scopes,
-                       static_cast<size_t>(maxPreloadNumAttr.getInt()));
+    IntegerAttr unroll;
+    for (auto scope : scopes)
+      if (scope && scope->hasAttr("hivm.cvp_query.unroll_factor")) {
+        unroll =
+            scope->getAttrOfType<IntegerAttr>("hivm.cvp_query.unroll_factor");
+        break;
+      }
+    if (unroll) {
+      if (failed(rewriteContinuousQueryUnroll(forOp, scopes, unroll.getInt())))
+        return signalPassFailure();
+    } else {
+      rewritePreloadLoop(forOp, scopes,
+                         static_cast<size_t>(maxPreloadNumAttr.getInt()));
+    }
   }
 
   cleanupPreloadWorkspaceMarks(*moduleOp);
@@ -689,6 +1160,7 @@ void CreatePreloadPass::runOnOperation() {
   patterns.add<PropagateAdaptor>(&getContext());
   if (failed(applyPatternsGreedily(moduleOp, std::move(patterns)))) {
     signalPassFailure();
+    return;
   }
 
   LDBG("After processing preload:\n" << *moduleOp);
@@ -700,6 +1172,12 @@ void CreatePreloadPass::runOnOperation() {
 
   if (failed(pm.run(moduleOp))) {
     signalPassFailure();
+    return;
+  }
+  if (transactional) {
+    if (failed(verify(moduleOp)))
+      return signalPassFailure();
+    original.getBodyRegion().takeBody(moduleOp.getBodyRegion());
   }
 }
 

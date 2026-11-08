@@ -390,6 +390,8 @@ public:
   using OpRewritePattern<hivm::MmadL1Op>::OpRewritePattern;
   LogicalResult matchAndRewrite(MmadL1Op op,
                                 PatternRewriter &rewriter) const final {
+    if (failed(op.verify()))
+      return failure();
     // inputs
     SmallVector<Value> libParams =
         op.getInputOperands(/*includeSyncRelatedArgs=*/false);
@@ -401,6 +403,14 @@ public:
     SmallVector<Value> additionalArgs;
     genAdditionalFunctionArgs(op, additionalArgs, rewriter);
     libParams.append(additionalArgs.begin(), additionalArgs.end());
+    if (auto cache = op.getCvpQCacheAttr()) {
+      auto role = cache.getAs<StringAttr>("role");
+      auto mode = cache.getAs<StringAttr>("mode");
+      if (role.getValue() == "qk" && mode.getValue() == "cached") {
+        libParams.push_back(op.getQCacheInit());
+        libParams.push_back(op.getQCacheByteOffset());
+      }
+    }
 
     replaceWithLibCall(rewriter, op,
                        cast<OpWithLibraryFunction>(op.getOperation())
@@ -437,11 +447,10 @@ public:
   LogicalResult matchAndRewrite(hivm::Conv1DL1Op op,
                                 PatternRewriter &rewriter) const final {
     SmallVector<Value> libParams = op.getLibraryCallOperands(rewriter);
-    replaceWithLibCall(
-        rewriter, op,
-        cast<OpWithLibraryFunction>(op.getOperation())
-            .getOpLibraryCallName(/*isOpsAligned=*/std::nullopt),
-        libParams, {});
+    replaceWithLibCall(rewriter, op,
+                       cast<OpWithLibraryFunction>(op.getOperation())
+                           .getOpLibraryCallName(/*isOpsAligned=*/std::nullopt),
+                       libParams, {});
     return success();
   }
 };
@@ -454,11 +463,10 @@ public:
   LogicalResult matchAndRewrite(hivm::Conv2DL1Op op,
                                 PatternRewriter &rewriter) const final {
     SmallVector<Value> libParams = op.getLibraryCallOperands(rewriter);
-    replaceWithLibCall(
-        rewriter, op,
-        cast<OpWithLibraryFunction>(op.getOperation())
-            .getOpLibraryCallName(/*isOpsAligned=*/std::nullopt),
-        libParams, {});
+    replaceWithLibCall(rewriter, op,
+                       cast<OpWithLibraryFunction>(op.getOperation())
+                           .getOpLibraryCallName(/*isOpsAligned=*/std::nullopt),
+                       libParams, {});
     return success();
   }
 };

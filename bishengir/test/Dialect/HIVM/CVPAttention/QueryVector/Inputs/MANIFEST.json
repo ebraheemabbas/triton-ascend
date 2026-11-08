@@ -1,0 +1,56 @@
+[
+  {
+    "file": "n32768-hd64-baseline.mlir",
+    "case": "n32768-hd64",
+    "BN": 256,
+    "HD": 64,
+    "arm": "baseline",
+    "sha256": "e9d2c12de57274aae1500c7aa8b5986c5f1e35b7b71189adf2ab364262dd338a",
+    "origin_tool_sha256": "1bf8f22c7b0106e2f33d031e7de75b2318b947ac90d7b9b396103a16244034bb"
+  },
+  {
+    "file": "n32768-hd64-key-major.mlir",
+    "case": "n32768-hd64",
+    "BN": 256,
+    "HD": 64,
+    "arm": "key-major",
+    "sha256": "79ef9eb687ed339f7032f456ef5a1813f4966e880ce5133329113113eb0b8c85",
+    "origin_tool_sha256": "1bf8f22c7b0106e2f33d031e7de75b2318b947ac90d7b9b396103a16244034bb"
+  },
+  {
+    "file": "n16384-hd128-baseline.mlir",
+    "case": "n16384-hd128",
+    "BN": 128,
+    "HD": 128,
+    "arm": "baseline",
+    "sha256": "6e8567cdb7b9e9bce59cc3107a9daf0ea230b2fcf49e19630ff997ec7b9be020",
+    "origin_tool_sha256": "1bf8f22c7b0106e2f33d031e7de75b2318b947ac90d7b9b396103a16244034bb"
+  },
+  {
+    "file": "n16384-hd128-key-major.mlir",
+    "case": "n16384-hd128",
+    "BN": 128,
+    "HD": 128,
+    "arm": "key-major",
+    "sha256": "c47c700283992937615c9df7f137a783312f339e81a2640797400f42bbe4ac8c",
+    "origin_tool_sha256": "1bf8f22c7b0106e2f33d031e7de75b2318b947ac90d7b9b396103a16244034bb"
+  },
+  {
+    "file": "n1024-hd128-baseline.mlir",
+    "case": "n1024-hd128",
+    "BN": 128,
+    "HD": 128,
+    "arm": "baseline",
+    "sha256": "a7543d47307adc5430c3a5bf7fa419145390ccc2afb34e648ce3be413df1ef78",
+    "origin_tool_sha256": "1bf8f22c7b0106e2f33d031e7de75b2318b947ac90d7b9b396103a16244034bb"
+  },
+  {
+    "file": "n1024-hd128-key-major.mlir",
+    "case": "n1024-hd128",
+    "BN": 128,
+    "HD": 128,
+    "arm": "key-major",
+    "sha256": "74f083dc4eb183bf771c76e0ea72d9b1cc50d52d1b466f30f14983f1f19746f8",
+    "origin_tool_sha256": "1bf8f22c7b0106e2f33d031e7de75b2318b947ac90d7b9b396103a16244034bb"
+  }
+]

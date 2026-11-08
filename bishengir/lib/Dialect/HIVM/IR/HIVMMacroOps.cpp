@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "bishengir/Dialect/HACC/Utils/Utils.h"
+#include "bishengir/Dialect/HIVM/IR/CVPQCacheContract.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/Interfaces/FlattenInterface.h"
@@ -133,16 +134,16 @@ getConvIntArrayAttrElement(Attribute attr, StringRef attrName, Dim dim,
   return (*values)[static_cast<size_t>(dim)];
 }
 
-FailureOr<int64_t> getConvPaddingAttrElement(
-    Attribute attr, size_t spatialRank, size_t symmetricDim,
-    size_t explicitSide, function_ref<InFlightDiagnostic()> emitError) {
+FailureOr<int64_t>
+getConvPaddingAttrElement(Attribute attr, size_t spatialRank,
+                          size_t symmetricDim, size_t explicitSide,
+                          function_ref<InFlightDiagnostic()> emitError) {
   if (auto intAttr = dyn_cast<IntegerAttr>(attr))
     return intAttr.getInt();
 
   SmallVector<int64_t, 6> values;
   if (auto denseAttr = dyn_cast<DenseI64ArrayAttr>(attr)) {
-    values.append(denseAttr.asArrayRef().begin(),
-                  denseAttr.asArrayRef().end());
+    values.append(denseAttr.asArrayRef().begin(), denseAttr.asArrayRef().end());
   } else if (auto arrayAttr = dyn_cast<ArrayAttr>(attr)) {
     values.reserve(arrayAttr.size());
     for (Attribute element : arrayAttr) {
@@ -581,7 +582,9 @@ void MmadL1Op::build(OpBuilder &odsBuilder, OperationState &odsState,
         real_k, real_n, c, /*sync_related_args*/ ValueRange{},
         /*unit_flag_cond*/ ValueRange{}, per_channel_bias, a_transpose,
         b_transpose, enable_HF32, enable_i4, /*unit_flag_mode*/ ArrayAttr{},
-        /*unit_flag_group_id*/ IntegerAttr{});
+        /*unit_flag_group_id*/ IntegerAttr{}, /*q_cache_init*/ Value{},
+        /*q_cache_generation*/ Value{}, /*q_cache_byte_offset*/ Value{},
+        /*cvp_q_cache*/ DictionaryAttr{});
 }
 
 int MmadL1Op::getNumSyncRelatedArgs() { return 7; }
@@ -615,10 +618,191 @@ LogicalResult MmadL1Op::verify() {
                          << numSyncRelatedArgs << " " << syncRelatedArgs;
   }
 
-  return success();
+  return verifyCVPQCacheMmad(*this);
 }
 namespace mlir {
 namespace hivm {
+
+DictionaryAttr buildCVPQCacheResources(MLIRContext *context, StringRef mode,
+                                       uint64_t aBytes, uint64_t bBytes) {
+  auto plan =
+      bishengir::cvp::deriveQCacheResources(aBytes, bBytes, 128, 256, 64, 2);
+  if (!plan.valid || !bishengir::cvp::supportedQCacheTarget(aBytes, bBytes) ||
+      (mode != "neutral" && mode != "cached"))
+    return {};
+  Builder builder(context);
+  SmallVector<NamedAttribute> fields;
+  auto number = [&](StringRef key, uint64_t value) {
+    fields.push_back(
+        builder.getNamedAttr(key, builder.getI64IntegerAttr(value)));
+  };
+  auto ranges = [&](StringRef key, const bishengir::cvp::ByteRange *values) {
+    SmallVector<int64_t> flat;
+    for (unsigned i = 0; i < 2; ++i) {
+      flat.push_back(values[i].begin);
+      flat.push_back(values[i].end);
+    }
+    fields.push_back(
+        builder.getNamedAttr(key, builder.getDenseI64ArrayAttr(flat)));
+  };
+  number("version", bishengir::cvp::kCubeResourceVersion);
+  fields.push_back(builder.getNamedAttr("mode", builder.getStringAttr(mode)));
+  fields.push_back(
+      builder.getNamedAttr("target", builder.getStringAttr("dav-c310")));
+  fields.push_back(
+      builder.getNamedAttr("q_clock", builder.getStringAttr("query")));
+  number("bm", 128);
+  number("bn", 256);
+  number("hd", 64);
+  number("element_bytes", 2);
+  number("l0a_bytes", aBytes);
+  number("l0b_bytes", bBytes);
+  number("q_slots", 2);
+  number("counter_banks", 2);
+  number("qk_chunk_k", plan.qkChunkK);
+  number("pv_chunk_k", plan.pvChunkK);
+  number("pv_chunks", plan.pvChunks);
+  number("unit_flag", 0);
+  ranges("a_ranges", plan.a);
+  ranges("pv_b_ranges", plan.pvB);
+  ranges("q_ranges", plan.q);
+  return builder.getDictionaryAttr(fields);
+}
+
+FailureOr<std::pair<uint64_t, uint64_t>>
+readCVPQCacheTargetCapacity(Operation *op) {
+  auto module = utils::getTopLevelModuleOp(op);
+  auto target = hacc::utils::getNPUTargetSpec(module);
+  if (!target)
+    return failure();
+  auto aEntry = target->getSpecForIdentifierEnum(hacc::DeviceSpec::L0A_SIZE);
+  auto bEntry = target->getSpecForIdentifierEnum(hacc::DeviceSpec::L0B_SIZE);
+  auto archEntry = target->getSpecForIdentifierEnum(hacc::DeviceSpec::ARCH);
+  auto aBits =
+      aEntry ? dyn_cast<IntegerAttr>(aEntry.getValue()) : IntegerAttr();
+  auto bBits =
+      bEntry ? dyn_cast<IntegerAttr>(bEntry.getValue()) : IntegerAttr();
+  auto arch =
+      archEntry ? dyn_cast<StringAttr>(archEntry.getValue()) : StringAttr();
+  if (!aBits || !bBits || !arch || arch.getValue() != "dav-c310" ||
+      aBits.getInt() <= 0 || bBits.getInt() <= 0 || aBits.getInt() % 8 ||
+      bBits.getInt() % 8)
+    return failure();
+  uint64_t a = aBits.getInt() / 8, b = bBits.getInt() / 8;
+  if (!bishengir::cvp::supportedQCacheTarget(a, b))
+    return failure();
+  return std::make_pair(a, b);
+}
+
+FailureOr<bishengir::cvp::QCacheResources>
+readCVPQCacheResources(func::FuncOp function) {
+  if (!function)
+    return failure();
+  auto resource = function->getAttrOfType<DictionaryAttr>(kCVPQCacheResources);
+  auto mode = resource ? resource.getAs<StringAttr>("mode") : StringAttr();
+  auto a = resource ? resource.getAs<IntegerAttr>("l0a_bytes") : IntegerAttr();
+  auto b = resource ? resource.getAs<IntegerAttr>("l0b_bytes") : IntegerAttr();
+  if (!mode || !a || !b || !a.getType().isInteger(64) ||
+      !b.getType().isInteger(64) || a.getInt() <= 0 || b.getInt() <= 0)
+    return failure();
+  auto expected = buildCVPQCacheResources(
+      function.getContext(), mode.getValue(), a.getInt(), b.getInt());
+  auto capacity = readCVPQCacheTargetCapacity(function);
+  if (!expected || expected != resource || failed(capacity) ||
+      capacity->first != static_cast<uint64_t>(a.getInt()) ||
+      capacity->second != static_cast<uint64_t>(b.getInt()))
+    return failure();
+  return bishengir::cvp::deriveQCacheResources(a.getInt(), b.getInt(), 128, 256,
+                                               64, 2);
+}
+
+LogicalResult verifyCVPQCacheMmad(MmadL1Op op) {
+  auto descriptor = op.getCvpQCacheAttr();
+  Attribute bankedReady = op->getAttr(kCVPCubeBankedReady);
+  bool context = bool(op.getQCacheInit()) || bool(op.getQCacheGeneration()) ||
+                 bool(op.getQCacheByteOffset());
+  if (!descriptor && !context && !bankedReady)
+    return success();
+  auto reject = [&](StringRef reason) -> LogicalResult {
+    return op.emitOpError("invalid CVP Q-cache contract: ") << reason;
+  };
+  if (!descriptor || descriptor.size() != 3)
+    return reject("expected version, mode and role");
+  auto version = descriptor.getAs<IntegerAttr>("version");
+  auto mode = descriptor.getAs<StringAttr>("mode");
+  auto role = descriptor.getAs<StringAttr>("role");
+  if (!version || !version.getType().isInteger(64) || version.getInt() != 1 ||
+      !mode || (mode.getValue() != "neutral" && mode.getValue() != "cached") ||
+      !role || (role.getValue() != "qk" && role.getValue() != "pv"))
+    return reject("unsupported version, mode or role");
+  auto function = op->getParentOfType<func::FuncOp>();
+  if (bankedReady) {
+    auto policy = function
+                      ? function->getAttrOfType<StringAttr>(kCVPCubeReadiness)
+                      : StringAttr();
+    if (!isa<UnitAttr>(bankedReady) || !policy ||
+        policy.getValue() != "banked-v1")
+      return reject("banked readiness requires its paired caller contract");
+  }
+  auto resources = readCVPQCacheResources(function);
+  if (failed(resources) ||
+      function->getAttrOfType<DictionaryAttr>(kCVPQCacheResources)
+              .getAs<StringAttr>("mode") != mode)
+    return reject("missing, inconsistent or unsupported target resources");
+  if (op.getNumResults() || op.getPerChannelBias() || op.getEnable_HF32() ||
+      op.getEnable_I4() || !op.getUnitFlagCond().empty() ||
+      (op.getUnitFlagModeAttr() && !op.getUnitFlagModeAttr().empty()) ||
+      (op.getUnitFlagGroupIdAttr() &&
+       op.getUnitFlagGroupIdAttr().getInt() != 0))
+    return reject("requires bufferized FP16/F32 mode0 without bias/HF32/I4");
+  auto memory = [](Value value, ArrayRef<int64_t> shape, unsigned width,
+                   AddressSpace space) {
+    auto type = dyn_cast<MemRefType>(value.getType());
+    auto element =
+        type ? dyn_cast<FloatType>(type.getElementType()) : FloatType();
+    return type && type.hasStaticShape() && type.getShape() == shape &&
+           type.getLayout().isIdentity() && element &&
+           element.getWidth() == width && (width != 16 || element.isF16()) &&
+           type.getMemorySpace() ==
+               AddressSpaceAttr::get(value.getContext(), space);
+  };
+  auto constant = [](Value value) -> std::optional<int64_t> {
+    return getConstantIntValue(value);
+  };
+  if (!op.isInitConstant(true))
+    return reject(
+        "requires a complete independently initialized matrix result");
+  if (role.getValue() == "qk") {
+    if (!op.getQCacheInit() || !op.getQCacheGeneration() ||
+        !op.getQCacheByteOffset() || op.getATranspose() ||
+        !op.getBTranspose() || constant(op.getRealM()) != 256 ||
+        constant(op.getRealK()) != 64 || constant(op.getRealN()) != 128 ||
+        !memory(op.getA(), {4, 16, 16, 16}, 16, AddressSpace::L1) ||
+        !memory(op.getB(), {4, 8, 16, 16}, 16, AddressSpace::L1) ||
+        !memory(op.getC(), {8, 16, 16, 16}, 32, AddressSpace::L0C))
+      return reject("unsupported QK layout, geometry or cache context");
+    auto assignedOffset = [&](Value value) {
+      auto offset = constant(value);
+      return offset &&
+             (*offset == static_cast<int64_t>(resources->q[0].begin) ||
+              *offset == static_cast<int64_t>(resources->q[1].begin));
+    };
+    auto selection = op.getQCacheByteOffset().getDefiningOp<arith::SelectOp>();
+    if (!assignedOffset(op.getQCacheByteOffset()) &&
+        (!selection || !assignedOffset(selection.getTrueValue()) ||
+         !assignedOffset(selection.getFalseValue())))
+      return reject("cache byte offset is outside the assigned query slots");
+  } else {
+    if (context || !op.getATranspose() || op.getBTranspose() ||
+        constant(op.getRealM()) != 128 || constant(op.getRealK()) != 256 ||
+        constant(op.getRealN()) != 64 ||
+        !memory(op.getA(), {8, 16, 16, 16}, 16, AddressSpace::L1) ||
+        !memory(op.getB(), {4, 16, 16, 16}, 16, AddressSpace::L1) ||
+        !memory(op.getC(), {4, 8, 16, 16}, 32, AddressSpace::L0C))
+      return reject("unsupported PV layout, geometry or cache context");
+  }
+  return success();
+}
 
 bool isSatisfiedBrcForPerChannel(hivm::VBrcOp brcOp,
                                  Operation *hookOp = nullptr) {
@@ -1591,15 +1775,15 @@ Conv1DL1Op::getLibraryCallOperands(PatternRewriter &rewriter) {
          "Conv1DL1Op padding must be verified");
   int64_t strideW = getStrideW();
   int64_t dilationW = getDilationW();
-  libParams.push_back(makeI64(0));        // padT
-  libParams.push_back(makeI64(0));        // padB
+  libParams.push_back(makeI64(0));         // padT
+  libParams.push_back(makeI64(0));         // padB
   libParams.push_back(makeI64(*paddingL)); // padL
   libParams.push_back(makeI64(*paddingR)); // padR
 
-  libParams.push_back(makeI64(1));      // strideH
+  libParams.push_back(makeI64(1));       // strideH
   libParams.push_back(makeI64(strideW)); // strideW
 
-  libParams.push_back(makeI64(1));          // dilationH
+  libParams.push_back(makeI64(1));         // dilationH
   libParams.push_back(makeI64(dilationW)); // dilationW
 
   // additional sync arguments
@@ -1622,15 +1806,13 @@ Conv1DL1Op::getLibraryCallOperands(PatternRewriter &rewriter) {
 //===----------------------------------------------------------------------===//
 
 FailureOr<int64_t> Conv2DL1Op::getStrideH() {
-  return getConvIntArrayAttrElement<2>(
-      getStrideAttr(), "stride", Conv2DDim::H,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<2>(getStrideAttr(), "stride", Conv2DDim::H,
+                                       [&]() { return emitOpError(); });
 }
 
 FailureOr<int64_t> Conv2DL1Op::getStrideW() {
-  return getConvIntArrayAttrElement<2>(
-      getStrideAttr(), "stride", Conv2DDim::W,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<2>(getStrideAttr(), "stride", Conv2DDim::W,
+                                       [&]() { return emitOpError(); });
 }
 
 FailureOr<int64_t> Conv2DL1Op::getPaddingT() {
@@ -1658,15 +1840,15 @@ FailureOr<int64_t> Conv2DL1Op::getPaddingR() {
 }
 
 FailureOr<int64_t> Conv2DL1Op::getDilationH() {
-  return getConvIntArrayAttrElement<2>(
-      getDilationAttr(), "dilation", Conv2DDim::H,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<2>(getDilationAttr(), "dilation",
+                                       Conv2DDim::H,
+                                       [&]() { return emitOpError(); });
 }
 
 FailureOr<int64_t> Conv2DL1Op::getDilationW() {
-  return getConvIntArrayAttrElement<2>(
-      getDilationAttr(), "dilation", Conv2DDim::W,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<2>(getDilationAttr(), "dilation",
+                                       Conv2DDim::W,
+                                       [&]() { return emitOpError(); });
 }
 
 LogicalResult Conv2DL1Op::verify() {
@@ -1676,8 +1858,8 @@ LogicalResult Conv2DL1Op::verify() {
   auto strideW = getStrideW();
   if (failed(strideW))
     return failure();
-  if (failed(getPaddingT()) || failed(getPaddingB()) ||
-      failed(getPaddingL()) || failed(getPaddingR()))
+  if (failed(getPaddingT()) || failed(getPaddingB()) || failed(getPaddingL()) ||
+      failed(getPaddingR()))
     return failure();
   auto dilationH = getDilationH();
   if (failed(dilationH))
@@ -1836,21 +2018,18 @@ Conv2DL1Op::getLibraryCallOperands(PatternRewriter &rewriter) {
 //===----------------------------------------------------------------------===//
 
 FailureOr<int64_t> Conv3DL1Op::getStrideD() {
-  return getConvIntArrayAttrElement<3>(
-      getStrideAttr(), "stride", Conv3DDim::D,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<3>(getStrideAttr(), "stride", Conv3DDim::D,
+                                       [&]() { return emitOpError(); });
 }
 
 FailureOr<int64_t> Conv3DL1Op::getStrideH() {
-  return getConvIntArrayAttrElement<3>(
-      getStrideAttr(), "stride", Conv3DDim::H,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<3>(getStrideAttr(), "stride", Conv3DDim::H,
+                                       [&]() { return emitOpError(); });
 }
 
 FailureOr<int64_t> Conv3DL1Op::getStrideW() {
-  return getConvIntArrayAttrElement<3>(
-      getStrideAttr(), "stride", Conv3DDim::W,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<3>(getStrideAttr(), "stride", Conv3DDim::W,
+                                       [&]() { return emitOpError(); });
 }
 
 FailureOr<int64_t> Conv3DL1Op::getPaddingFront() {
@@ -1890,21 +2069,21 @@ FailureOr<int64_t> Conv3DL1Op::getPaddingR() {
 }
 
 FailureOr<int64_t> Conv3DL1Op::getDilationD() {
-  return getConvIntArrayAttrElement<3>(
-      getDilationAttr(), "dilation", Conv3DDim::D,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<3>(getDilationAttr(), "dilation",
+                                       Conv3DDim::D,
+                                       [&]() { return emitOpError(); });
 }
 
 FailureOr<int64_t> Conv3DL1Op::getDilationH() {
-  return getConvIntArrayAttrElement<3>(
-      getDilationAttr(), "dilation", Conv3DDim::H,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<3>(getDilationAttr(), "dilation",
+                                       Conv3DDim::H,
+                                       [&]() { return emitOpError(); });
 }
 
 FailureOr<int64_t> Conv3DL1Op::getDilationW() {
-  return getConvIntArrayAttrElement<3>(
-      getDilationAttr(), "dilation", Conv3DDim::W,
-      [&]() { return emitOpError(); });
+  return getConvIntArrayAttrElement<3>(getDilationAttr(), "dilation",
+                                       Conv3DDim::W,
+                                       [&]() { return emitOpError(); });
 }
 
 LogicalResult Conv3DL1Op::verify() {
@@ -1924,8 +2103,8 @@ LogicalResult Conv3DL1Op::verify() {
            << "requires strideH and strideW to be in the range [1, 255]";
 
   if (failed(getPaddingFront()) || failed(getPaddingBack()) ||
-      failed(getPaddingT()) || failed(getPaddingB()) ||
-      failed(getPaddingL()) || failed(getPaddingR()))
+      failed(getPaddingT()) || failed(getPaddingB()) || failed(getPaddingL()) ||
+      failed(getPaddingR()))
     return failure();
   auto dilationD = getDilationD();
   if (failed(dilationD))

@@ -41,6 +41,42 @@ struct OtherPass : public PassWrapper<OtherPass, OperationPass<>> {
   int &counter;
 };
 
+struct ReplaceModuleBodyPass
+    : public PassWrapper<ReplaceModuleBodyPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ReplaceModuleBodyPass)
+
+  explicit ReplaceModuleBodyPass(bool fail = false) : fail(fail) {}
+  StringRef getArgument() const override { return "test-replace-module-body"; }
+
+  void runOnOperation() override {
+    ModuleOp original = getOperation();
+    OwningOpRef<ModuleOp> candidate(cast<ModuleOp>(original->clone()));
+    ModuleOp replacement = *candidate;
+    original.getBodyRegion().takeBody(replacement.getBodyRegion());
+    original->setAttr("test.body_replaced", UnitAttr::get(&getContext()));
+    if (fail)
+      signalPassFailure();
+  }
+
+  bool fail;
+};
+
+struct ObserveFunctionsPass
+    : public PassWrapper<ObserveFunctionsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ObserveFunctionsPass)
+
+  explicit ObserveFunctionsPass(llvm::SmallVector<Operation *> &seen)
+      : seen(seen) {}
+  StringRef getArgument() const override { return "test-observe-functions"; }
+
+  void runOnOperation() override {
+    for (func::FuncOp func : getOperation().getOps<func::FuncOp>())
+      seen.push_back(func.getOperation());
+  }
+
+  llvm::SmallVector<Operation *> &seen;
+};
+
 // ── Fixture ──────────────────────────────────────────────────────────────────
 
 class FilterPassesTest : public ::testing::Test {
@@ -90,6 +126,44 @@ protected:
     return mod;
   }
 
+  void expectFilteredFunctionsSurviveBodyReplacement(bool failPass) {
+    auto attr = filterAttr("test-observe-functions");
+    auto mod = makeModuleTwoFuncs(attr, attr);
+    ModuleOp module = *mod;
+    llvm::SmallVector<Operation *> originalFunctions;
+    llvm::SmallVector<DictionaryAttr> originalAttrs;
+    for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+      func->setAttr("test.preserved", builder->getStringAttr(func.getName()));
+      originalFunctions.push_back(func.getOperation());
+      originalAttrs.push_back(func->getAttrDictionary());
+    }
+
+    llvm::SmallVector<Operation *> seen;
+    bishengir::BiShengIRPassManager pm(config, &context, "builtin.module",
+                                       mlir::PassManager::Nesting::Implicit);
+    pm.addPass(std::make_unique<ReplaceModuleBodyPass>(failPass));
+    pm.addPass(std::make_unique<ObserveFunctionsPass>(seen));
+    LogicalResult result = static_cast<mlir::PassManager &>(pm).run(mod.get());
+    EXPECT_EQ(failed(result), failPass);
+    EXPECT_TRUE(module->hasAttr("test.body_replaced"));
+
+    llvm::SmallVector<Operation *> restored;
+    for (func::FuncOp func : module.getOps<func::FuncOp>())
+      restored.push_back(func.getOperation());
+    ASSERT_EQ(restored.size(), 2u);
+    for (unsigned i = 0; i < restored.size(); ++i) {
+      EXPECT_EQ(restored[i], originalFunctions[i]);
+      EXPECT_EQ(restored[i]->getAttrDictionary(), originalAttrs[i]);
+      auto func = cast<func::FuncOp>(restored[i]);
+      ASSERT_TRUE(func.getBody().hasOneBlock());
+      EXPECT_TRUE(isa<func::ReturnOp>(func.getBody().front().getTerminator()));
+    }
+    if (failPass)
+      EXPECT_TRUE(seen.empty());
+    else
+      EXPECT_EQ(seen, restored);
+  }
+
 private:
   void addFunc(mlir::ModuleOp mod, llvm::StringRef name,
                mlir::annotation::FilterPassesAttr attr) {
@@ -105,7 +179,6 @@ private:
   }
 
 protected:
-
   bishengir::BiShengIRCompileConfigBase config;
   MLIRContext context;
   std::unique_ptr<OpBuilder> builder;
@@ -336,6 +409,14 @@ TEST_F(FilterPassesTest, FilteredFuncsRestoredAfterModulePass) {
   ASSERT_EQ(names.size(), 2u);
   EXPECT_TRUE(llvm::is_contained(names, "func_a"));
   EXPECT_TRUE(llvm::is_contained(names, "func_b"));
+}
+
+TEST_F(FilterPassesTest, FilteredFuncsSurviveModuleBodyReplacement) {
+  expectFilteredFunctionsSurviveBodyReplacement(false);
+}
+
+TEST_F(FilterPassesTest, FilteredFuncsSurviveFailedModuleBodyReplacement) {
+  expectFilteredFunctionsSurviveBodyReplacement(true);
 }
 
 } // namespace

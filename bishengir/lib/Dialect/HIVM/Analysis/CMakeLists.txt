@@ -1,4 +1,5 @@
 add_bishengir_dialect_library(BiShengIRHIVMAnalysis
+  CVPAttentionPlan.cpp
   DimensionAnalyzer.cpp
   DimensionMarker.cpp
   Initializer.cpp
