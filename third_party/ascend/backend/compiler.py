@@ -1701,6 +1701,11 @@ class NPUOptions:
     cvp_query_key_unroll: Optional[int] = None
     cvp_invariant_cache_mode: Optional[str] = None
     cvp_invariant_cache_consider_overlapping: Optional[bool] = None
+    # Compatibility-only fields keep legacy recipe keywords discoverable to
+    # Triton JIT option validation. parse_options routes their values to the
+    # canonical invariant-cache fields above.
+    cvp_q_cache_mode: Optional[str] = field(default=None, init=False)
+    cvp_q_cache_consider_overlapping: Optional[bool] = field(default=None, init=False)
     enable_cvp_cube_banked_ready: Optional[bool] = None
     enable_cvp_cube_overlap: Optional[bool] = None
     enable_cvp_cube_derived_drain: Optional[bool] = None
@@ -1801,6 +1806,12 @@ class NPUOptions:
         # Keep the legacy name discoverable while its property and all
         # compiler decisions continue to use the injected target architecture.
         self.__dict__["arch"] = arch
+        # Preserve the legacy metadata keys for retained launch contracts. They
+        # mirror the authoritative canonical values; parse_options still maps
+        # legacy inputs before constructing this object.
+        object.__setattr__(self, "cvp_q_cache_mode", self.cvp_invariant_cache_mode)
+        object.__setattr__(self, "cvp_q_cache_consider_overlapping",
+                           self.cvp_invariant_cache_consider_overlapping)
         object.__setattr__(self, "multibuffer_mode", _multibuffer_mode_to_tuple(self.multibuffer_mode))
         if self.multibuffer_mode is not None and self.num_stages is not None:
             raise ValueError("num_stages and multibuffer_mode cannot be specified together")
@@ -2059,7 +2070,13 @@ class AscendBackend(BaseBackend):
             # Normalize a copy, except for the legacy launch keyword below.
             # NPUOptions retains compatibility defaults for legacy names so
             # JIT and Inductor can still recognize them as compile options.
-            normalized_opts = opts if internal_options else _remove_deprecated_npu_options(opts)
+            normalized_opts = opts if internal_options else dict(opts)
+            if not internal_options:
+                # The legacy invariant-cache names are not NPUOptions fields, so
+                # map them before the general deprecated-option cleanup drops
+                # unrecognized keys.
+                _normalize_invariant_cache_keys(normalized_opts)
+                normalized_opts = _remove_deprecated_npu_options(normalized_opts)
             args = {k: normalized_opts[k] for k in option_names if k in normalized_opts}
             options = NPUOptions(arch=self.target.arch, **args)
             # Lazy init enable_dynamic_cv_pipeline if not provided.

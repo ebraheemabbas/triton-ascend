@@ -88,6 +88,8 @@ _DEPRECATED_NPU_OPTIONS = frozenset({
     "graph_optimize_ub_capacity_bytes",
     "grid_num_tiles",
     "has_auto_blockify_blacklist_op",
+    "cvp_q_cache_mode",
+    "cvp_q_cache_consider_overlapping",
     "inter_cache_num",
     "intra_cache_num",
     "kernel_name",
@@ -129,6 +131,8 @@ _DEPRECATED_NPU_OPTION_ROUTE_PRECEDENCE = (
 # Renamed value options preserve the complete user value.  A simultaneously
 # supplied canonical option wins via setdefault below.
 _DEPRECATED_NPU_OPTION_ALIASES = {
+    "cvp_q_cache_mode": "cvp_invariant_cache_mode",
+    "cvp_q_cache_consider_overlapping": "cvp_invariant_cache_consider_overlapping",
     "intra_cache_num": "buf_slot_num_of_veccore",
     "inter_cache_num": "buf_slot_num_of_crosscore",
     "load_cache_num": "buf_slot_num_of_gm",

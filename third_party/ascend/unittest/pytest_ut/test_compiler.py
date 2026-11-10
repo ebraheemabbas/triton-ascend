@@ -244,6 +244,54 @@ def test_legacy_routes_preserve_precedence_and_input(raw, expected):
     assert options.hash() == baseline.hash()
 
 
+def test_legacy_invariant_cache_keys_normalize_before_cleanup():
+    backend = compiler.AscendBackend(GPUTarget("npu", "Ascend910_9581", 32))
+    required = {
+        "enable_cvp_query_pipeline": True,
+        "cvp_query_pipeline_mode": "skew",
+        "cvp_query_key_unroll": 1,
+        "enable_cvp_attention_key_major": True,
+        "allow_cvp_attention_sum_reassociation": True,
+        "enable_dynamic_cv_pipeline": False,
+        "enable_mixed_cv": True,
+        "enable_preload": True,
+        "enable_vf_operand_substitution": True,
+        "enable_fused_multiply_add": False,
+    }
+    legacy = {
+        **required,
+        "cvp_q_cache_mode": "cached",
+        "cvp_q_cache_consider_overlapping": True,
+    }
+    canonical = {
+        **required,
+        "cvp_invariant_cache_mode": "cached",
+        "cvp_invariant_cache_consider_overlapping": True,
+    }
+    original = dict(legacy)
+
+    options = backend.parse_options(legacy)
+    baseline = backend.parse_options(canonical)
+
+    assert legacy == original
+    assert options.__dict__ == baseline.__dict__
+    assert options.hash() == baseline.hash()
+
+    @triton.jit
+    def kernel():
+        pass
+
+    packed = kernel._pack_args(backend, legacy, {}, [], None)[0]
+    packed_baseline = kernel._pack_args(backend, canonical, {}, [], None)[0]
+
+    assert "cvp_q_cache_mode" in packed.__dict__
+    assert "cvp_q_cache_consider_overlapping" in packed.__dict__
+    assert packed.cvp_q_cache_mode == packed.cvp_invariant_cache_mode == "cached"
+    assert packed.cvp_q_cache_consider_overlapping is True
+    assert packed.__dict__ == packed_baseline.__dict__
+    assert packed.hash() == packed_baseline.hash()
+
+
 def test_simt_alias_obeys_target_and_mode_restrictions(backend):
     raw = {"enable_bishengir_simt_optimization": 101}
 
